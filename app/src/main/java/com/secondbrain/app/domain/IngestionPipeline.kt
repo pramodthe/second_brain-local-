@@ -10,6 +10,7 @@ import com.secondbrain.app.data.NoteDocument
 import com.secondbrain.app.data.RelationEdge
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.UUID
 
 data class IngestionResult(
     val note: NoteDocument,
@@ -24,33 +25,58 @@ class IngestionPipeline(
     private val llm: LlmEngine
 ) {
 
-    /**
-     * Full pipeline:
-     * 1. Vector embedding generation
-     * 2. Ontology & entity extraction (LLM / rules)
-     * 3. Entity resolution against existing graph
-     * 4. Atomic persistence in CozoDB
-     */
-    suspend fun ingest(
+    /** Persists the user's original note before any AI work begins. */
+    suspend fun capture(
         title: String,
         content: String,
         source: String = "manual"
-    ): Result<IngestionResult> = withContext(Dispatchers.Default) {
+    ): Result<NoteDocument> = withContext(Dispatchers.IO) {
         runCatching {
-            val id = "n" + System.currentTimeMillis()
+            val capturedAt = System.currentTimeMillis() / 1000.0
             val note = NoteDocument(
-                id = id,
-                title = title.ifBlank { "Untitled Note" },
+                id = "n-${UUID.randomUUID()}",
+                title = title.trim(),
                 content = content,
-                timestamp = System.currentTimeMillis() / 1000.0,
-                source = source
+                timestamp = capturedAt,
+                source = source,
+                modifiedTimestamp = capturedAt
             )
+            store.putNote(note).getOrThrow()
+            note
+        }
+    }
+
+    /** Updates raw note text while keeping the original creation time and source. */
+    suspend fun update(
+        existing: NoteDocument,
+        title: String,
+        content: String
+    ): Result<NoteDocument> = withContext(Dispatchers.IO) {
+        runCatching {
+            val updated = existing.copy(
+                title = title.trim(),
+                content = content,
+                modifiedTimestamp = System.currentTimeMillis() / 1000.0
+            )
+            store.putNote(updated).getOrThrow()
+            updated
+        }
+    }
+
+    /**
+     * Generates the derived embedding and knowledge graph after the raw note is safe.
+     */
+    suspend fun enrich(note: NoteDocument): Result<IngestionResult> = withContext(Dispatchers.Default) {
+        runCatching {
+            val titleAndContent = listOf(note.title, note.content)
+                .filter { it.isNotBlank() }
+                .joinToString("\n")
 
             // Step 1: Generate Embedding
-            val embedding = embedder.embed("$title\n$content")
+            val embedding = embedder.embed(titleAndContent)
 
             // Step 2: Extract Entities & Relations
-            val extracted = llm.extractOntology(content)
+            val extracted = llm.extractOntology(note.content)
 
             // Step 3: Entity Resolution (deduplication against existing nodes)
             val resolved = resolveEntities(extracted)
@@ -67,6 +93,16 @@ class IngestionPipeline(
                 vectorDimension = embedding.size
             )
         }
+    }
+
+    /** Capture plus enrichment for imports and diagnostic callers that need a completed result. */
+    suspend fun ingest(
+        title: String,
+        content: String,
+        source: String = "manual"
+    ): Result<IngestionResult> = runCatching {
+        val note = capture(title, content, source).getOrThrow()
+        enrich(note).getOrThrow()
     }
 
     private suspend fun resolveEntities(raw: ExtractedKnowledge): ExtractedKnowledge {

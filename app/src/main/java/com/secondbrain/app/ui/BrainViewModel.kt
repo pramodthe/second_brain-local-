@@ -16,6 +16,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 data class ChatMessageItem(
     val sender: String, // "user" or "brain"
@@ -25,6 +27,8 @@ data class ChatMessageItem(
 )
 
 class BrainViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val noteProcessingMutex = Mutex()
 
     val store = BrainStore(application)
     val embedder = EmbedderEngine(application)
@@ -50,6 +54,9 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _isIngesting = MutableStateFlow(false)
     val isIngesting: StateFlow<Boolean> = _isIngesting.asStateFlow()
+
+    private val _processingNoteIds = MutableStateFlow<Set<String>>(emptySet())
+    val processingNoteIds: StateFlow<Set<String>> = _processingNoteIds.asStateFlow()
 
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
@@ -94,11 +101,32 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun saveNote(title: String, content: String, onComplete: () -> Unit = {}) {
+        saveNote(existing = null, title = title, content = content, onComplete = onComplete)
+    }
+
+    fun saveNote(
+        existing: NoteDocument?,
+        title: String,
+        content: String,
+        onComplete: () -> Unit = {}
+    ) {
         if (content.isBlank()) return
         viewModelScope.launch {
             _isIngesting.value = true
+            var savedNote: NoteDocument? = null
             try {
-                pipeline.ingest(title, content).getOrThrow()
+                savedNote = if (existing == null) {
+                    pipeline.capture(title, content).getOrThrow()
+                } else {
+                    pipeline.update(existing, title, content).getOrThrow()
+                }
+
+                val note = requireNotNull(savedNote)
+                _notes.value = if (existing == null) {
+                    listOf(note) + _notes.value
+                } else {
+                    _notes.value.map { if (it.id == note.id) note else it }
+                }
                 refreshData()
                 onComplete()
             } catch (error: Exception) {
@@ -106,6 +134,23 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
             } finally {
                 _isIngesting.value = false
             }
+
+            savedNote?.let { processNote(it) }
+        }
+    }
+
+    private suspend fun processNote(note: NoteDocument) {
+        _processingNoteIds.value = _processingNoteIds.value + note.id
+        try {
+            noteProcessingMutex.withLock {
+                pipeline.enrich(note)
+                    .onSuccess { refreshData() }
+                    .onFailure { error ->
+                        _appError.value = "Note saved, but automatic organization failed: ${error.message ?: "unknown error"}"
+                    }
+            }
+        } finally {
+            _processingNoteIds.value = _processingNoteIds.value - note.id
         }
     }
 

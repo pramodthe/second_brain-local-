@@ -58,6 +58,12 @@ class BrainStore(private val context: Context) {
                 :put note {id => title, content, at, source}
                 """.trimIndent()
             )
+            d.run(
+                """
+                ?[note_id, modified_at] <- [["${esc(note.id)}", ${note.modifiedTimestamp}]]
+                :put note_meta {note_id => modified_at}
+                """.trimIndent()
+            )
 
             // 2. Store Entities
             if (knowledge.entities.isNotEmpty()) {
@@ -130,13 +136,17 @@ class BrainStore(private val context: Context) {
             """.trimIndent()
 
             val rows = d.run(query)
+            val modifiedTimes = loadModifiedTimes(d)
             rows.map { r ->
+                val id = r.rows[0].asString()
+                val createdAt = r.rows[3].asDouble()
                 val doc = NoteDocument(
-                    id = r.rows[0].asString(),
+                    id = id,
                     title = r.rows[1].asString(),
                     content = r.rows[2].asString(),
-                    timestamp = r.rows[3].asDouble(),
-                    source = r.rows[4].asString()
+                    timestamp = createdAt,
+                    source = r.rows[4].asString(),
+                    modifiedTimestamp = modifiedTimes[id] ?: createdAt
                 )
                 val dist = r.rows[5].asFloat()
                 doc to dist
@@ -207,13 +217,17 @@ class BrainStore(private val context: Context) {
                     :limit 10
                 """.trimIndent()
                 val noteRows = runCatching { d.run(noteQuery) }.getOrDefault(emptyList())
+                val modifiedTimes = loadModifiedTimes(d)
                 val notes = noteRows.map { r ->
+                    val id = r.rows[0].asString()
+                    val createdAt = r.rows[3].asDouble()
                     NoteDocument(
-                        id = r.rows[0].asString(),
+                        id = id,
                         title = r.rows[1].asString(),
                         content = r.rows[2].asString(),
-                        timestamp = r.rows[3].asDouble(),
-                        source = r.rows[4].asString()
+                        timestamp = createdAt,
+                        source = r.rows[4].asString(),
+                        modifiedTimestamp = modifiedTimes[id] ?: createdAt
                     )
                 }
 
@@ -264,17 +278,27 @@ class BrainStore(private val context: Context) {
         runCatching {
             val d = db ?: error("Database not open")
             val rows = d.run("?[id, title, content, at, source] := *note{id, title, content, at, source} :order -at :limit $limit")
+            val modifiedTimes = loadModifiedTimes(d)
             rows.map { r ->
+                val id = r.rows[0].asString()
+                val createdAt = r.rows[3].asDouble()
                 NoteDocument(
-                    id = r.rows[0].asString(),
+                    id = id,
                     title = r.rows[1].asString(),
                     content = r.rows[2].asString(),
-                    timestamp = r.rows[3].asDouble(),
-                    source = r.rows[4].asString()
+                    timestamp = createdAt,
+                    source = r.rows[4].asString(),
+                    modifiedTimestamp = modifiedTimes[id] ?: createdAt
                 )
             }
         }
     }
+
+    private fun loadModifiedTimes(d: CozoDb): Map<String, Double> =
+        runCatching {
+            d.run("?[note_id, modified_at] := *note_meta{note_id, modified_at}")
+                .associate { row -> row.rows[0].asString() to row.rows[1].asDouble() }
+        }.getOrDefault(emptyMap())
 
     suspend fun getStats(): Map<String, Int> = withContext(Dispatchers.IO) {
         val d = db ?: return@withContext emptyMap()
@@ -295,6 +319,7 @@ class BrainStore(private val context: Context) {
 
         private val SCHEMA = listOf(
             ":create note {id: String => title: String, content: String, at: Float, source: String}",
+            ":create note_meta {note_id: String => modified_at: Float}",
             ":create entity {name: String => category: String, description: String, at: Float}",
             ":create edge {source: String, relation: String, target: String => at: Float}",
             ":create note_entity {note_id: String, entity_name: String => at: Float}",

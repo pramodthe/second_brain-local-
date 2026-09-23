@@ -56,7 +56,8 @@ data class NoteDocument(
     val title: String,
     val content: String,
     val timestamp: Double = System.currentTimeMillis() / 1000.0,
-    val source: String = "manual"
+    val source: String = "manual",
+    val modifiedTimestamp: Double = timestamp
 )
 
 data class ExtractedKnowledge(

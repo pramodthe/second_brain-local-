@@ -7,6 +7,7 @@ An offline-first Android knowledge workspace that turns notes and shared text in
 ## Highlights
 
 - Capture notes in the app or share plain text from another Android app.
+- Save raw notes immediately, edit them later, and retain created/modified timestamps.
 - Store notes, entities, and relationships locally in CozoDB.
 - Retrieve relevant notes with HNSW vector search, then expand related graph context.
 - Explore the ontology with an interactive force-directed graph or a filtered list.
@@ -25,6 +26,17 @@ Ingestion pipeline ----> embeddings ----> CozoDB HNSW index
                                                   |
 Question -> query embedding -> similar notes -> graph expansion -> local LLM answer
 ```
+
+Note capture is intentionally split into two steps. The original text is written to local storage first; embeddings and ontology extraction then run in the background. A slow or unavailable model therefore cannot prevent a note from being saved.
+
+## Product roadmap
+
+- **Phase 1 — Capture foundation:** instant text capture, optional titles, editing, timestamps, and background organization.
+- **Phase 2 — Voice capture:** durable recordings, playback, and offline transcription.
+- **Phase 3 — Processing queue:** persistent, resumable AI jobs with visible status and retries.
+- **Phase 4 — Knowledge quality:** aliases, duplicate resolution, evidence, confidence, and review workflows.
+- **Phase 5 — Retrieval:** stronger search, related notes, timelines, and source-grounded answers.
+- **Phase 6 — Ownership:** encrypted export, backup, restore, and production hardening.
 
 ## Requirements
 

@@ -49,6 +49,7 @@ enum class BrainTab(val label: String) {
 fun BrainApp(viewModel: BrainViewModel) {
     var selectedTab by rememberSaveable { mutableStateOf(BrainTab.NOTES) }
     var showComposer by rememberSaveable { mutableStateOf(false) }
+    var editingNote by remember { mutableStateOf<NoteDocument?>(null) }
     val appError by viewModel.appError.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -113,7 +114,10 @@ fun BrainApp(viewModel: BrainViewModel) {
         floatingActionButton = {
             if (selectedTab == BrainTab.NOTES) {
                 ExtendedFloatingActionButton(
-                    onClick = { showComposer = true },
+                    onClick = {
+                        editingNote = null
+                        showComposer = true
+                    },
                     icon = { Icon(Icons.Default.Edit, contentDescription = null) },
                     text = { Text("New note") }
                 )
@@ -126,7 +130,17 @@ fun BrainApp(viewModel: BrainViewModel) {
                 .padding(padding)
         ) {
             when (selectedTab) {
-                BrainTab.NOTES -> NotesScreen(viewModel, onNewNote = { showComposer = true })
+                BrainTab.NOTES -> NotesScreen(
+                    viewModel = viewModel,
+                    onNewNote = {
+                        editingNote = null
+                        showComposer = true
+                    },
+                    onEditNote = { note ->
+                        editingNote = note
+                        showComposer = true
+                    }
+                )
                 BrainTab.EXPLORE -> GraphScreen(viewModel)
                 BrainTab.ASK -> ChatScreen(viewModel)
             }
@@ -136,7 +150,11 @@ fun BrainApp(viewModel: BrainViewModel) {
     if (showComposer) {
         NoteComposerSheet(
             viewModel = viewModel,
-            onDismiss = { showComposer = false }
+            existingNote = editingNote,
+            onDismiss = {
+                showComposer = false
+                editingNote = null
+            }
         )
     }
 }
@@ -144,10 +162,12 @@ fun BrainApp(viewModel: BrainViewModel) {
 @Composable
 fun NotesScreen(
     viewModel: BrainViewModel,
-    onNewNote: () -> Unit
+    onNewNote: () -> Unit,
+    onEditNote: (NoteDocument) -> Unit
 ) {
     val notes by viewModel.notes.collectAsState()
     val stats by viewModel.stats.collectAsState()
+    val processingNoteIds by viewModel.processingNoteIds.collectAsState()
     var searchQuery by rememberSaveable { mutableStateOf("") }
 
     val visibleNotes = remember(notes, searchQuery) {
@@ -219,7 +239,13 @@ fun NotesScreen(
         if (visibleNotes.isEmpty()) {
             item { EmptyNotesState(searchQuery.isNotBlank(), onNewNote) }
         } else {
-            items(visibleNotes, key = { it.id }) { note -> NoteCard(note) }
+            items(visibleNotes, key = { it.id }) { note ->
+                NoteCard(
+                    note = note,
+                    isProcessing = note.id in processingNoteIds,
+                    onOpen = { onEditNote(note) }
+                )
+            }
         }
     }
 }
@@ -277,10 +303,9 @@ private fun EmptyNotesState(isSearching: Boolean, onNewNote: () -> Unit) {
 }
 
 @Composable
-fun NoteCard(note: NoteDocument) {
-    var expanded by rememberSaveable(note.id) { mutableStateOf(false) }
+fun NoteCard(note: NoteDocument, isProcessing: Boolean, onOpen: () -> Unit) {
     Card(
-        modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded },
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen),
         shape = RoundedCornerShape(18.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
@@ -289,20 +314,26 @@ fun NoteCard(note: NoteDocument) {
             Row(verticalAlignment = Alignment.Top) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        note.title.ifBlank { "Untitled note" },
+                        noteDisplayTitle(note),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        formatNoteDate(note.timestamp),
+                        buildString {
+                            append(formatNoteDateTime(note.timestamp))
+                            if (note.modifiedTimestamp > note.timestamp + 1.0) {
+                                append(" · Edited ")
+                                append(formatNoteDateTime(note.modifiedTimestamp))
+                            }
+                        },
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 Icon(
-                    if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                    contentDescription = if (expanded) "Collapse note" else "Expand note",
+                    Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                    contentDescription = "Open note",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
@@ -310,18 +341,32 @@ fun NoteCard(note: NoteDocument) {
             Text(
                 note.content.trim(),
                 style = MaterialTheme.typography.bodyLarge,
-                maxLines = if (expanded) Int.MAX_VALUE else 3,
+                maxLines = 3,
                 overflow = TextOverflow.Ellipsis,
                 lineHeight = 24.sp
             )
             Spacer(Modifier.height(14.dp))
-            Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
-                Text(
-                    note.source.replaceFirstChar { it.uppercase() },
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer
-                )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+                    Text(
+                        note.source.replaceFirstChar { it.uppercase() },
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                }
+                if (isProcessing) {
+                    Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.primaryContainer) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp)
+                            Spacer(Modifier.width(6.dp))
+                            Text("Organizing", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                }
             }
         }
     }
@@ -329,9 +374,13 @@ fun NoteCard(note: NoteDocument) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun NoteComposerSheet(viewModel: BrainViewModel, onDismiss: () -> Unit) {
-    var title by rememberSaveable { mutableStateOf("") }
-    var content by rememberSaveable { mutableStateOf("") }
+private fun NoteComposerSheet(
+    viewModel: BrainViewModel,
+    existingNote: NoteDocument?,
+    onDismiss: () -> Unit
+) {
+    var title by rememberSaveable(existingNote?.id) { mutableStateOf(existingNote?.title.orEmpty()) }
+    var content by rememberSaveable(existingNote?.id) { mutableStateOf(existingNote?.content.orEmpty()) }
     val isIngesting by viewModel.isIngesting.collectAsState()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
@@ -347,9 +396,17 @@ private fun NoteComposerSheet(viewModel: BrainViewModel, onDismiss: () -> Unit) 
                 .imePadding()
                 .padding(start = 20.dp, end = 20.dp, bottom = 28.dp)
         ) {
-            Text("New note", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
             Text(
-                "Write naturally. Connections are extracted after you save.",
+                if (existingNote == null) "New note" else "Edit note",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                if (existingNote == null) {
+                    "Write naturally. Your note saves before AI organization begins."
+                } else {
+                    "Created ${formatNoteDateTime(existingNote.timestamp)}"
+                },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -357,8 +414,8 @@ private fun NoteComposerSheet(viewModel: BrainViewModel, onDismiss: () -> Unit) 
             OutlinedTextField(
                 value = title,
                 onValueChange = { title = it },
-                label = { Text("Title") },
-                placeholder = { Text("Give this idea a name") },
+                label = { Text("Title (optional)") },
+                placeholder = { Text("Add a title, or leave it blank") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 shape = RoundedCornerShape(14.dp)
@@ -375,7 +432,9 @@ private fun NoteComposerSheet(viewModel: BrainViewModel, onDismiss: () -> Unit) 
             )
             Spacer(Modifier.height(16.dp))
             Button(
-                onClick = { viewModel.saveNote(title, content) { onDismiss() } },
+                onClick = {
+                    viewModel.saveNote(existingNote, title, content) { onDismiss() }
+                },
                 enabled = content.isNotBlank() && !isIngesting,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
                 shape = RoundedCornerShape(14.dp)
@@ -387,11 +446,11 @@ private fun NoteComposerSheet(viewModel: BrainViewModel, onDismiss: () -> Unit) 
                         color = MaterialTheme.colorScheme.onPrimary
                     )
                     Spacer(Modifier.width(10.dp))
-                    Text("Finding connections…")
+                    Text("Saving…")
                 } else {
                     Icon(Icons.Default.Add, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("Save note")
+                    Text(if (existingNote == null) "Save note" else "Save changes")
                 }
             }
         }
@@ -828,7 +887,7 @@ fun ChatBubble(message: ChatMessageItem) {
                             context.relatedNotes.distinctBy { it.id }.take(4).forEach { note ->
                                 Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surface) {
                                     Column(Modifier.padding(10.dp)) {
-                                        Text(note.title.ifBlank { "Untitled note" }, fontWeight = FontWeight.SemiBold)
+                                        Text(noteDisplayTitle(note), fontWeight = FontWeight.SemiBold)
                                         Text(
                                             note.content,
                                             maxLines = 2,
@@ -854,7 +913,17 @@ fun ChatBubble(message: ChatMessageItem) {
     }
 }
 
-private fun formatNoteDate(timestampSeconds: Double): String {
+private fun noteDisplayTitle(note: NoteDocument): String {
+    if (note.title.isNotBlank()) return note.title
+    return note.content
+        .lineSequence()
+        .map { it.trim() }
+        .firstOrNull { it.isNotBlank() }
+        ?.take(72)
+        ?: "Untitled note"
+}
+
+private fun formatNoteDateTime(timestampSeconds: Double): String {
     val milliseconds = (timestampSeconds * 1_000).toLong()
-    return DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(milliseconds))
+    return DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(milliseconds))
 }
