@@ -12,6 +12,7 @@ import com.secondbrain.app.ai.SpeechEngine
 import com.secondbrain.app.ai.VoiceRecorder
 import com.secondbrain.app.data.BrainStore
 import com.secondbrain.app.data.EntityNode
+import com.secondbrain.app.data.KnowledgeReviewItem
 import com.secondbrain.app.data.NoteDocument
 import com.secondbrain.app.data.ProcessingJob
 import com.secondbrain.app.data.ProcessingJobStatus
@@ -79,6 +80,9 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
     private val _processingJobs = MutableStateFlow<List<ProcessingJob>>(emptyList())
     val processingJobs: StateFlow<List<ProcessingJob>> = _processingJobs.asStateFlow()
 
+    private val _knowledgeReviews = MutableStateFlow<List<KnowledgeReviewItem>>(emptyList())
+    val knowledgeReviews: StateFlow<List<KnowledgeReviewItem>> = _knowledgeReviews.asStateFlow()
+
     private val _isRecording = MutableStateFlow(false)
     val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
 
@@ -142,6 +146,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
         _notes.value = store.getRecentNotes(100).getOrDefault(emptyList())
         _entities.value = store.getAllEntities().getOrDefault(emptyList())
         _edges.value = store.getAllEdges().getOrDefault(emptyList())
+        _knowledgeReviews.value = store.getKnowledgeReviews().getOrDefault(emptyList())
         _stats.value = store.getStats()
     }
 
@@ -340,6 +345,31 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             store.removeFinishedProcessingJobs()
             refreshProcessingJobs()
+        }
+    }
+
+    fun acceptKnowledgeReview(item: KnowledgeReviewItem) {
+        resolveKnowledgeReview(item, accept = true)
+    }
+
+    fun rejectKnowledgeReview(item: KnowledgeReviewItem) {
+        resolveKnowledgeReview(item, accept = false)
+    }
+
+    private fun resolveKnowledgeReview(item: KnowledgeReviewItem, accept: Boolean) {
+        viewModelScope.launch {
+            store.resolveKnowledgeReview(item.id, accept)
+                .onFailure { error ->
+                    _appError.value = "Could not update the review: ${error.message ?: "unknown error"}"
+                }
+            loadData()
+        }
+    }
+
+    fun clearResolvedKnowledgeReviews() {
+        viewModelScope.launch {
+            store.removeResolvedKnowledgeReviews()
+            loadData()
         }
     }
 

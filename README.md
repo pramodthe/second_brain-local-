@@ -10,7 +10,8 @@ An offline-first Android knowledge workspace that turns notes and shared text in
 - Record voice notes, preserve the original audio, play it back, and transcribe it fully offline.
 - Save raw notes immediately, edit them later, and retain created/modified timestamps.
 - Continue transcription and knowledge extraction through a durable background queue after restarts.
-- Store notes, entities, and relationships locally in CozoDB.
+- Store notes, entities, aliases, evidence, and relationships locally in CozoDB.
+- Keep uncertain entities, relationships, and possible duplicates out of the graph until you review them.
 - Retrieve relevant notes with HNSW vector search, then expand related graph context.
 - Explore the ontology with an interactive force-directed graph or a filtered list.
 - Use a local Qwen GGUF model for extraction and grounded answers when one is installed.
@@ -24,11 +25,14 @@ Text / share sheet ---------> durable note ----> persistent job queue ----> embe
 Voice ----> durable WAV ----> offline transcript <---+                         v
                                                                        CozoDB HNSW index
                                                                               |
-                                                entities + relationships <-----+
-                                                                         |
-                                                                         v
-                                                                  knowledge graph
-                                                                         |
+                                                extracted proposals <----------+
+                                                        |
+                                      evidence + confidence + resolution
+                                             /                         \
+                                      accepted                      review inbox
+                                         |                                |
+                                         +--------> knowledge graph <------+
+                                                        |
 Question -> query embedding -> similar notes -> graph expansion -> local LLM answer
 ```
 
@@ -39,7 +43,7 @@ Capture is intentionally durable-first. Original text or audio is written to pri
 - **Phase 1 — Capture foundation (complete):** instant text capture, optional titles, editing, timestamps, and background organization.
 - **Phase 2 — Voice capture (complete):** durable recordings, playback, offline transcription, visible processing state, and retry.
 - **Phase 3 — Processing queue (complete):** persistent, resumable AI jobs with visible status, retries, cancellation, and deduplication.
-- **Phase 4 — Knowledge quality:** aliases, duplicate resolution, evidence, confidence, and review workflows.
+- **Phase 4 — Knowledge quality (complete):** aliases, duplicate resolution, evidence, confidence, and review workflows.
 - **Phase 5 — Retrieval:** stronger search, related notes, timelines, and source-grounded answers.
 - **Phase 6 — Ownership:** encrypted export, backup, restore, and production hardening.
 
@@ -90,6 +94,18 @@ The engine tries NPU, GPU, and CPU in that order. On the tested RMX5011/Snapdrag
 Every transcription and ontology-extraction request is first persisted in CozoDB. Android WorkManager then drains this queue serially so only one heavy on-device inference task runs at a time. Stable job IDs deduplicate repeated requests, while a note edited during processing supersedes the older run and is processed again with its latest contents.
 
 The **Tasks** screen shows queued, running, completed, failed, and cancelled work with progress and attempt counts. Failed or cancelled jobs can be retried; active jobs can be cancelled cooperatively. If Android terminates the process, any interrupted job returns to the queue when WorkManager or the app starts again.
+
+## Knowledge quality and review
+
+Ontology extraction is treated as a proposal, not ground truth. The local model must return a confidence score and a short exact quote from the source note for every entity and relationship. The resolver verifies that evidence against the saved note, caps unsupported claims below the automatic-accept threshold, and sends ambiguous output to **Tasks → Review**.
+
+The review inbox supports three decisions:
+
+- Accept or reject a proposed entity.
+- Accept or reject a proposed relationship, with its source quote visible.
+- Confirm a likely duplicate, which records the proposed spelling as an alias of the canonical entity instead of creating another graph node.
+
+Accepted aliases participate in later entity resolution and Explore search. Entity cards expose confidence, aliases, provenance evidence, and relationship evidence. Existing databases migrate additively: old graph rows remain accepted with their original data, while new quality metadata is stored in separate CozoDB relations.
 
 ## Verify on a device
 

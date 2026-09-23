@@ -109,7 +109,11 @@ class BrainProbeReceiver : BroadcastReceiver() {
             val res = pipeline.ingest(title, content, "probe")
             if (res.isSuccess) {
                 val r = res.getOrThrow()
-                Log.i(TAG, "TEST 3 PASS: Ingested '${title}' (entities=${r.entitiesExtracted}, edges=${r.relationsExtracted})")
+                Log.i(
+                    TAG,
+                    "TEST 3 PASS: Ingested '$title' (entities=${r.entitiesExtracted}, " +
+                        "edges=${r.relationsExtracted}, reviews=${r.reviewsCreated})"
+                )
             } else {
                 Log.e(TAG, "TEST 3 FAIL: Ingestion error for '$title': ${res.exceptionOrNull()?.message}")
             }
@@ -117,7 +121,11 @@ class BrainProbeReceiver : BroadcastReceiver() {
 
         // 4. Verify Stored Graph Stats
         val stats = store.getStats()
-        Log.i(TAG, "TEST 4 STATS: Notes=${stats["notes"]}, Entities=${stats["entities"]}, Edges=${stats["edges"]}")
+        Log.i(
+            TAG,
+            "TEST 4 STATS: Notes=${stats["notes"]}, Entities=${stats["entities"]}, " +
+                "Edges=${stats["edges"]}, Pending reviews=${stats["reviews"]}"
+        )
 
         // 5. Test Vector Similarity Search (HNSW)
         val searchResults = store.searchSimilarNotes(embedder.embed("compliance and audit trails"), k = 2)

@@ -5,6 +5,7 @@ import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.cozodb.CozoDb
+import org.json.JSONArray
 import java.io.File
 
 /**
@@ -17,6 +18,20 @@ class BrainStore(private val context: Context) {
         val path: String,
         val durationMs: Long,
         val status: TranscriptionStatus
+    )
+
+    private data class EntityQuality(
+        val confidence: Double,
+        val status: KnowledgeStatus,
+        val evidence: String,
+        val noteId: String
+    )
+
+    private data class EdgeQuality(
+        val confidence: Double,
+        val status: KnowledgeStatus,
+        val evidence: String,
+        val noteId: String
     )
 
     private var db: CozoDb? = null
@@ -91,6 +106,20 @@ class BrainStore(private val context: Context) {
                     """.trimIndent()
                 )
 
+                val qualityRows = knowledge.entities.joinToString(", ") { e ->
+                    """["${esc(e.name)}", ${e.confidence.coerceIn(0.0, 1.0)}, "${e.status.name}", "${esc(e.evidence)}", "${esc(e.sourceNoteId.ifBlank { note.id })}"]"""
+                }
+                d.run(
+                    """
+                    ?[name, confidence, status, evidence, note_id] <- [$qualityRows]
+                    :put entity_quality {name => confidence, status, evidence, note_id}
+                    """.trimIndent()
+                )
+
+                knowledge.entities.forEach { entity ->
+                    putAliases(d, entity.name, entity.aliases, entity.confidence, entity.sourceNoteId.ifBlank { note.id })
+                }
+
                 // Link note to entities
                 val noteEntityRows = knowledge.entities.joinToString(", ") { e ->
                     """["${esc(note.id)}", "${esc(e.name)}", ${now()}]"""
@@ -112,6 +141,15 @@ class BrainStore(private val context: Context) {
                     """
                     ?[source, relation, target, at] <- [$edgeRows]
                     :put edge {source, relation, target => at}
+                    """.trimIndent()
+                )
+                val edgeQualityRows = knowledge.relations.joinToString(", ") { r ->
+                    """["${esc(r.source)}", "${r.relation.name}", "${esc(r.target)}", ${r.confidence.coerceIn(0.0, 1.0)}, "${r.status.name}", "${esc(r.evidence)}", "${esc(r.sourceNoteId.ifBlank { note.id })}"]"""
+                }
+                d.run(
+                    """
+                    ?[source, relation, target, confidence, status, evidence, note_id] <- [$edgeQualityRows]
+                    :put edge_quality {source, relation, target => confidence, status, evidence, note_id}
                     """.trimIndent()
                 )
             }
@@ -196,12 +234,21 @@ class BrainStore(private val context: Context) {
                     :limit 30
                 """.trimIndent()
                 val edgeRows = d.run(edgeQuery)
+                val edgeQualities = loadEdgeQualities(d)
                 val edges = edgeRows.map { r ->
+                    val source = r.rows[0].asString()
+                    val relation = RelationType.fromString(r.rows[1].asString())
+                    val target = r.rows[2].asString()
+                    val quality = edgeQualities[edgeKey(source, relation.name, target)]
                     RelationEdge(
-                        source = r.rows[0].asString(),
-                        relation = RelationType.fromString(r.rows[1].asString()),
-                        target = r.rows[2].asString(),
-                        timestamp = r.rows[3].asDouble()
+                        source = source,
+                        relation = relation,
+                        target = target,
+                        timestamp = r.rows[3].asDouble(),
+                        confidence = quality?.confidence ?: 1.0,
+                        evidence = quality?.evidence.orEmpty(),
+                        sourceNoteId = quality?.noteId.orEmpty(),
+                        status = quality?.status ?: KnowledgeStatus.ACCEPTED
                     )
                 }
 
@@ -216,12 +263,21 @@ class BrainStore(private val context: Context) {
                         ($entityFilter)
                 """.trimIndent()
                 val entityRows = d.run(entityQuery)
+                val entityQualities = loadEntityQualities(d)
+                val aliases = loadAliasesByCanonical(d)
                 val entities = entityRows.map { r ->
+                    val name = r.rows[0].asString()
+                    val quality = entityQualities[name]
                     EntityNode(
-                        name = r.rows[0].asString(),
+                        name = name,
                         category = EntityCategory.fromString(r.rows[1].asString()),
                         description = r.rows[2].asString(),
-                        timestamp = r.rows[3].asDouble()
+                        timestamp = r.rows[3].asDouble(),
+                        aliases = aliases[name].orEmpty(),
+                        confidence = quality?.confidence ?: 1.0,
+                        evidence = quality?.evidence.orEmpty(),
+                        sourceNoteId = quality?.noteId.orEmpty(),
+                        status = quality?.status ?: KnowledgeStatus.ACCEPTED
                     )
                 }
 
@@ -266,12 +322,21 @@ class BrainStore(private val context: Context) {
         runCatching {
             val d = db ?: error("Database not open")
             val rows = d.run("?[name, category, description, at] := *entity{name, category, description, at} :order -at")
+            val qualities = loadEntityQualities(d)
+            val aliases = loadAliasesByCanonical(d)
             rows.map { r ->
+                val name = r.rows[0].asString()
+                val quality = qualities[name]
                 EntityNode(
-                    name = r.rows[0].asString(),
+                    name = name,
                     category = EntityCategory.fromString(r.rows[1].asString()),
                     description = r.rows[2].asString(),
-                    timestamp = r.rows[3].asDouble()
+                    timestamp = r.rows[3].asDouble(),
+                    aliases = aliases[name].orEmpty(),
+                    confidence = quality?.confidence ?: 1.0,
+                    evidence = quality?.evidence.orEmpty(),
+                    sourceNoteId = quality?.noteId.orEmpty(),
+                    status = quality?.status ?: KnowledgeStatus.ACCEPTED
                 )
             }
         }
@@ -284,12 +349,21 @@ class BrainStore(private val context: Context) {
         runCatching {
             val d = db ?: error("Database not open")
             val rows = d.run("?[source, relation, target, at] := *edge{source, relation, target, at} :order -at")
+            val qualities = loadEdgeQualities(d)
             rows.map { r ->
+                val source = r.rows[0].asString()
+                val relation = RelationType.fromString(r.rows[1].asString())
+                val target = r.rows[2].asString()
+                val quality = qualities[edgeKey(source, relation.name, target)]
                 RelationEdge(
-                    source = r.rows[0].asString(),
-                    relation = RelationType.fromString(r.rows[1].asString()),
-                    target = r.rows[2].asString(),
-                    timestamp = r.rows[3].asDouble()
+                    source = source,
+                    relation = relation,
+                    target = target,
+                    timestamp = r.rows[3].asDouble(),
+                    confidence = quality?.confidence ?: 1.0,
+                    evidence = quality?.evidence.orEmpty(),
+                    sourceNoteId = quality?.noteId.orEmpty(),
+                    status = quality?.status ?: KnowledgeStatus.ACCEPTED
                 )
             }
         }
@@ -347,6 +421,136 @@ class BrainStore(private val context: Context) {
                 audioDurationMs = audio?.durationMs,
                 transcriptionStatus = audio?.status ?: TranscriptionStatus.NONE
             )
+        }
+    }
+
+    suspend fun getAcceptedAliasMap(): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            d.run(
+                """
+                ?[alias, canonical_name] := *entity_alias{alias, canonical_name, status},
+                    status == "${KnowledgeStatus.ACCEPTED.name}"
+                """.trimIndent()
+            ).associate { row -> row.rows[0].asString() to row.rows[1].asString() }
+        }
+    }
+
+    suspend fun putKnowledgeReviews(items: List<KnowledgeReviewItem>): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            if (items.isEmpty()) return@runCatching Unit
+            val rows = items.joinToString(", ") { item ->
+                """["${esc(item.id)}", "${item.kind.name}", "${item.status.name}", "${esc(item.noteId)}", "${esc(item.subject)}", "${esc(item.candidate)}", "${esc(item.schemaType)}", "${esc(item.description)}", "${esc(JSONArray(item.aliases).toString())}", ${item.confidence.coerceIn(0.0, 1.0)}, "${esc(item.evidence)}", ${item.createdTimestamp}, ${item.updatedTimestamp}]"""
+            }
+            d.run(
+                """
+                ?[id, kind, status, note_id, subject, candidate, schema_type, description, aliases, confidence, evidence, created_at, updated_at] <- [$rows]
+                :put review_item {id => kind, status, note_id, subject, candidate, schema_type, description, aliases, confidence, evidence, created_at, updated_at}
+                """.trimIndent()
+            )
+            Unit
+        }
+    }
+
+    suspend fun getKnowledgeReviews(
+        status: ReviewStatus? = ReviewStatus.PENDING,
+        limit: Int = 100
+    ): Result<List<KnowledgeReviewItem>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            val statusFilter = status?.let { ", status == \"${it.name}\"" }.orEmpty()
+            d.run(
+                """
+                ?[id, kind, status, note_id, subject, candidate, schema_type, description, aliases, confidence, evidence, created_at, updated_at] :=
+                    *review_item{id, kind, status, note_id, subject, candidate, schema_type, description, aliases, confidence, evidence, created_at, updated_at}$statusFilter
+                :order -updated_at
+                :limit ${limit.coerceIn(1, 500)}
+                """.trimIndent()
+            ).map(::knowledgeReviewFromRow)
+        }
+    }
+
+    suspend fun removePendingKnowledgeReviews(noteId: String): Result<Int> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            val items = getKnowledgeReviews(null, 500).getOrThrow().filter {
+                it.noteId == noteId && it.status == ReviewStatus.PENDING
+            }
+            items.forEach { removeReview(d, it.id) }
+            items.size
+        }
+    }
+
+    suspend fun resolveKnowledgeReview(itemId: String, accept: Boolean): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            val item = getKnowledgeReviews(null, 500).getOrThrow().firstOrNull { it.id == itemId }
+                ?: error("Review item not found")
+            if (item.status != ReviewStatus.PENDING) return@runCatching Unit
+
+            if (accept) {
+                when (item.kind) {
+                    ReviewKind.ENTITY -> {
+                        val entity = EntityNode(
+                            name = item.subject,
+                            category = EntityCategory.fromString(item.schemaType),
+                            description = item.description,
+                            aliases = item.aliases,
+                            confidence = item.confidence,
+                            evidence = item.evidence,
+                            sourceNoteId = item.noteId
+                        )
+                        putEntity(d, entity, item.noteId)
+                    }
+
+                    ReviewKind.DUPLICATE -> {
+                        val canonical = item.candidate.ifBlank { item.subject }
+                        putAliases(d, canonical, listOf(item.subject) + item.aliases, item.confidence, item.noteId)
+                        linkNoteEntity(d, item.noteId, canonical)
+                    }
+
+                    ReviewKind.RELATION -> {
+                        val aliases = getAcceptedAliasMap().getOrDefault(emptyMap())
+                            .mapKeys { normalizeEntityName(it.key) }
+                        val source = aliases[normalizeEntityName(item.subject)] ?: item.subject
+                        val target = aliases[normalizeEntityName(item.candidate)] ?: item.candidate
+                        ensureEntityExists(d, source, item.noteId)
+                        ensureEntityExists(d, target, item.noteId)
+                        putEdge(
+                            d,
+                            RelationEdge(
+                                source = source,
+                                relation = RelationType.fromString(item.schemaType),
+                                target = target,
+                                confidence = item.confidence,
+                                evidence = item.evidence,
+                                sourceNoteId = item.noteId
+                            )
+                        )
+                    }
+                }
+            }
+
+            putKnowledgeReviews(
+                listOf(
+                    item.copy(
+                        status = if (accept) ReviewStatus.ACCEPTED else ReviewStatus.REJECTED,
+                        updatedTimestamp = now()
+                    )
+                )
+            ).getOrThrow()
+            Unit
+        }
+    }
+
+    suspend fun removeResolvedKnowledgeReviews(): Result<Int> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            val items = getKnowledgeReviews(null, 500).getOrThrow()
+                .filter { it.status != ReviewStatus.PENDING }
+            items.forEach { removeReview(d, it.id) }
+            items.size
         }
     }
 
@@ -492,6 +696,158 @@ class BrainStore(private val context: Context) {
         updatedTimestamp = row.rows[9].asDouble()
     )
 
+    private fun knowledgeReviewFromRow(row: CozoDb.RelationRow): KnowledgeReviewItem = KnowledgeReviewItem(
+        id = row.rows[0].asString(),
+        kind = ReviewKind.fromString(row.rows[1].asString()),
+        status = ReviewStatus.fromString(row.rows[2].asString()),
+        noteId = row.rows[3].asString(),
+        subject = row.rows[4].asString(),
+        candidate = row.rows[5].asString(),
+        schemaType = row.rows[6].asString(),
+        description = row.rows[7].asString(),
+        aliases = runCatching {
+            val array = JSONArray(row.rows[8].asString())
+            List(array.length()) { index -> array.optString(index) }.filter { it.isNotBlank() }
+        }.getOrDefault(emptyList()),
+        confidence = row.rows[9].asDouble(),
+        evidence = row.rows[10].asString(),
+        createdTimestamp = row.rows[11].asDouble(),
+        updatedTimestamp = row.rows[12].asDouble()
+    )
+
+    private fun putEntity(d: CozoDb, entity: EntityNode, noteId: String) {
+        d.run(
+            """
+            ?[name, category, description, at] <- [["${esc(entity.name)}", "${entity.category.name}", "${esc(entity.description)}", ${entity.timestamp}]]
+            :put entity {name => category, description, at}
+            """.trimIndent()
+        )
+        d.run(
+            """
+            ?[name, confidence, status, evidence, note_id] <- [["${esc(entity.name)}", ${entity.confidence.coerceIn(0.0, 1.0)}, "${KnowledgeStatus.ACCEPTED.name}", "${esc(entity.evidence)}", "${esc(noteId)}"]]
+            :put entity_quality {name => confidence, status, evidence, note_id}
+            """.trimIndent()
+        )
+        putAliases(d, entity.name, entity.aliases, entity.confidence, noteId)
+        linkNoteEntity(d, noteId, entity.name)
+    }
+
+    private fun putEdge(d: CozoDb, edge: RelationEdge) {
+        d.run(
+            """
+            ?[source, relation, target, at] <- [["${esc(edge.source)}", "${edge.relation.name}", "${esc(edge.target)}", ${edge.timestamp}]]
+            :put edge {source, relation, target => at}
+            """.trimIndent()
+        )
+        d.run(
+            """
+            ?[source, relation, target, confidence, status, evidence, note_id] <- [["${esc(edge.source)}", "${edge.relation.name}", "${esc(edge.target)}", ${edge.confidence.coerceIn(0.0, 1.0)}, "${KnowledgeStatus.ACCEPTED.name}", "${esc(edge.evidence)}", "${esc(edge.sourceNoteId)}"]]
+            :put edge_quality {source, relation, target => confidence, status, evidence, note_id}
+            """.trimIndent()
+        )
+    }
+
+    private fun ensureEntityExists(d: CozoDb, name: String, noteId: String) {
+        if (name.isBlank()) return
+        val exists = d.run(
+            """
+            ?[name] := *entity{name}, name == "${esc(name)}"
+            :limit 1
+            """.trimIndent()
+        ).isNotEmpty()
+        if (!exists) {
+            putEntity(
+                d,
+                EntityNode(name = name, category = EntityCategory.CONCEPT, sourceNoteId = noteId),
+                noteId
+            )
+        } else {
+            linkNoteEntity(d, noteId, name)
+        }
+    }
+
+    private fun linkNoteEntity(d: CozoDb, noteId: String, entityName: String) {
+        d.run(
+            """
+            ?[note_id, entity_name, at] <- [["${esc(noteId)}", "${esc(entityName)}", ${now()}]]
+            :put note_entity {note_id, entity_name => at}
+            """.trimIndent()
+        )
+    }
+
+    private fun putAliases(
+        d: CozoDb,
+        canonicalName: String,
+        aliases: List<String>,
+        confidence: Double,
+        noteId: String
+    ) {
+        aliases.map { it.trim() }
+            .filter { it.isNotBlank() && normalizeEntityName(it) != normalizeEntityName(canonicalName) }
+            .distinctBy(::normalizeEntityName)
+            .forEach { alias ->
+                d.run(
+                    """
+                    ?[alias, canonical_name, confidence, status, note_id, at] <- [["${esc(alias)}", "${esc(canonicalName)}", ${confidence.coerceIn(0.0, 1.0)}, "${KnowledgeStatus.ACCEPTED.name}", "${esc(noteId)}", ${now()}]]
+                    :put entity_alias {alias => canonical_name, confidence, status, note_id, at}
+                    """.trimIndent()
+                )
+            }
+    }
+
+    private fun removeReview(d: CozoDb, itemId: String) {
+        d.run(
+            """
+            ?[id] <- [["${esc(itemId)}"]]
+            :rm review_item {id}
+            """.trimIndent()
+        )
+    }
+
+    private fun loadEntityQualities(d: CozoDb): Map<String, EntityQuality> = runCatching {
+        d.run("?[name, confidence, status, evidence, note_id] := *entity_quality{name, confidence, status, evidence, note_id}")
+            .associate { row ->
+                row.rows[0].asString() to EntityQuality(
+                    confidence = row.rows[1].asDouble(),
+                    status = KnowledgeStatus.fromString(row.rows[2].asString()),
+                    evidence = row.rows[3].asString(),
+                    noteId = row.rows[4].asString()
+                )
+            }
+    }.getOrDefault(emptyMap())
+
+    private fun loadAliasesByCanonical(d: CozoDb): Map<String, List<String>> = runCatching {
+        d.run(
+            """
+            ?[alias, canonical_name] := *entity_alias{alias, canonical_name, status},
+                status == "${KnowledgeStatus.ACCEPTED.name}"
+            """.trimIndent()
+        ).groupBy(
+            keySelector = { it.rows[1].asString() },
+            valueTransform = { it.rows[0].asString() }
+        )
+    }.getOrDefault(emptyMap())
+
+    private fun loadEdgeQualities(d: CozoDb): Map<String, EdgeQuality> = runCatching {
+        d.run("?[source, relation, target, confidence, status, evidence, note_id] := *edge_quality{source, relation, target, confidence, status, evidence, note_id}")
+            .associate { row ->
+                edgeKey(row.rows[0].asString(), row.rows[1].asString(), row.rows[2].asString()) to EdgeQuality(
+                    confidence = row.rows[3].asDouble(),
+                    status = KnowledgeStatus.fromString(row.rows[4].asString()),
+                    evidence = row.rows[5].asString(),
+                    noteId = row.rows[6].asString()
+                )
+            }
+    }.getOrDefault(emptyMap())
+
+    private fun edgeKey(source: String, relation: String, target: String): String =
+        "${normalizeEntityName(source)}|${relation.uppercase()}|${normalizeEntityName(target)}"
+
+    private fun normalizeEntityName(value: String): String = value
+        .lowercase()
+        .replace(Regex("[^a-z0-9]+"), " ")
+        .trim()
+
     private fun loadModifiedTimes(d: CozoDb): Map<String, Double> =
         runCatching {
             d.run("?[note_id, modified_at] := *note_meta{note_id, modified_at}")
@@ -515,7 +871,11 @@ class BrainStore(private val context: Context) {
         val noteCount = runCatching { d.run("?[count(id)] := *note{id}").firstOrNull()?.rows?.get(0)?.asInteger() ?: 0 }.getOrDefault(0)
         val entityCount = runCatching { d.run("?[count(name)] := *entity{name}").firstOrNull()?.rows?.get(0)?.asInteger() ?: 0 }.getOrDefault(0)
         val edgeCount = runCatching { d.run("?[count(source)] := *edge{source, relation, target}").firstOrNull()?.rows?.get(0)?.asInteger() ?: 0 }.getOrDefault(0)
-        mapOf("notes" to noteCount, "entities" to entityCount, "edges" to edgeCount)
+        val reviewCount = runCatching {
+            d.run("?[count(id)] := *review_item{id, status}, status == \"${ReviewStatus.PENDING.name}\"")
+                .firstOrNull()?.rows?.get(0)?.asInteger() ?: 0
+        }.getOrDefault(0)
+        mapOf("notes" to noteCount, "entities" to entityCount, "edges" to edgeCount, "reviews" to reviewCount)
     }
 
     fun close() {
@@ -533,8 +893,12 @@ class BrainStore(private val context: Context) {
             ":create note_audio {note_id: String => path: String, duration_ms: Int, status: String}",
             ":create processing_job {id: String => note_id: String, type: String, status: String, progress: Int, message: String, error: String, attempt: Int, created_at: Float, updated_at: Float}",
             ":create entity {name: String => category: String, description: String, at: Float}",
+            ":create entity_quality {name: String => confidence: Float, status: String, evidence: String, note_id: String}",
+            ":create entity_alias {alias: String => canonical_name: String, confidence: Float, status: String, note_id: String, at: Float}",
             ":create edge {source: String, relation: String, target: String => at: Float}",
+            ":create edge_quality {source: String, relation: String, target: String => confidence: Float, status: String, evidence: String, note_id: String}",
             ":create note_entity {note_id: String, entity_name: String => at: Float}",
+            ":create review_item {id: String => kind: String, status: String, note_id: String, subject: String, candidate: String, schema_type: String, description: String, aliases: String, confidence: Float, evidence: String, created_at: Float, updated_at: Float}",
             ":create note_vector {note_id: String => embedding: <F32; 256>, at: Float}",
             "::hnsw create note_vector:vec_idx {dim: 256, m: 24, ef_construction: 64, fields: [embedding], distance: Cosine}"
         )

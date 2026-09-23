@@ -187,15 +187,22 @@ class LlmEngine(private val context: Context) {
             }
 
             val prompt = """
-            You are a Knowledge Graph extractor. Read the following text and extract key entities and relationships according to this schema:
+            You are a conservative Knowledge Graph extractor. Read the following note and extract only entities and relationships directly supported by its words.
             Entity categories: Concept, Project, Resource, Person, Decision, Insight
             Relation types: DEPENDS_ON, CONTRADICTS, EXTENDS, MENTIONS, SUPERSEDES, DERIVED_FROM, USES_CONCEPT, AUTHORED_BY, RELATED_TO
 
             Return ONLY valid JSON matching this format:
             {
-              "entities": [{"name": "...", "category": "Concept|Project|...", "description": "..."}],
-              "relations": [{"source": "...", "relation": "DEPENDS_ON|...", "target": "..."}]
+              "entities": [{"name": "...", "category": "Concept|Project|...", "description": "...", "aliases": ["..."], "evidence": "exact quote from the note", "confidence": 0.0}],
+              "relations": [{"source": "...", "relation": "DEPENDS_ON|...", "target": "...", "evidence": "exact quote from the note", "confidence": 0.0}]
             }
+
+            Rules:
+            - Evidence must be a short, exact substring copied from the note.
+            - Confidence is a number from 0 to 1. Use 0.80 or above only when the evidence is explicit.
+            - Do not infer facts that the note does not state.
+            - Use a canonical, concise entity name. Put alternate spellings or abbreviations in aliases.
+            - Relation endpoints must exactly match an entity name or alias in the entities array.
 
             Text:
             $text
@@ -217,7 +224,7 @@ class LlmEngine(private val context: Context) {
             val sb = StringBuilder()
             engine.generateStreamFlow(
                 template.formattedText,
-                GenerationConfig(maxTokens = 384)
+                GenerationConfig(maxTokens = 768)
             ).collect { res ->
                 when (res) {
                     is LlmStreamResult.Token -> sb.append(res.text)
@@ -291,7 +298,10 @@ class LlmEngine(private val context: Context) {
                         EntityNode(
                             name = e.getString("name").trim(),
                             category = EntityCategory.fromString(e.optString("category", "Concept")),
-                            description = e.optString("description", "")
+                            description = e.optString("description", ""),
+                            aliases = e.optJSONArray("aliases")?.toStringList().orEmpty(),
+                            evidence = e.optString("evidence", ""),
+                            confidence = e.optDouble("confidence", 0.5).coerceIn(0.0, 1.0)
                         )
                     )
                 }
@@ -305,7 +315,9 @@ class LlmEngine(private val context: Context) {
                         RelationEdge(
                             source = r.getString("source").trim(),
                             relation = RelationType.fromString(r.optString("relation", "RELATED_TO")),
-                            target = r.getString("target").trim()
+                            target = r.getString("target").trim(),
+                            evidence = r.optString("evidence", ""),
+                            confidence = r.optDouble("confidence", 0.5).coerceIn(0.0, 1.0)
                         )
                     )
                 }
@@ -317,6 +329,12 @@ class LlmEngine(private val context: Context) {
 
     private fun ExtractedKnowledge.ifEmptyFallback(fallback: () -> ExtractedKnowledge): ExtractedKnowledge {
         return if (entities.isEmpty() && relations.isEmpty()) fallback() else this
+    }
+
+    private fun JSONArray.toStringList(): List<String> = buildList {
+        for (index in 0 until length()) {
+            optString(index).trim().takeIf { it.isNotBlank() }?.let(::add)
+        }
     }
 
     /**
@@ -343,7 +361,20 @@ class LlmEngine(private val context: Context) {
                 m.contains("Kleppmann", ignoreCase = true) || m.contains("Forte", ignoreCase = true) -> EntityCategory.PERSON
                 else -> EntityCategory.CONCEPT
             }
-            entities.add(EntityNode(name = m, category = cat, description = "Extracted from note"))
+            val evidence = text.split(Regex("(?<=[.!?])\\s+|\\n+"))
+                .firstOrNull { it.contains(m, ignoreCase = true) }
+                ?.trim()
+                ?.take(220)
+                ?: m
+            entities.add(
+                EntityNode(
+                    name = m,
+                    category = cat,
+                    description = "Candidate extracted from note",
+                    confidence = 0.55,
+                    evidence = evidence
+                )
+            )
         }
 
         // Connect consecutive entities
@@ -353,7 +384,11 @@ class LlmEngine(private val context: Context) {
                     RelationEdge(
                         source = entities[i].name,
                         relation = RelationType.RELATED_TO,
-                        target = entities[i + 1].name
+                        target = entities[i + 1].name,
+                        confidence = 0.45,
+                        evidence = listOf(entities[i].evidence, entities[i + 1].evidence)
+                            .firstOrNull { it.contains(entities[i].name, true) && it.contains(entities[i + 1].name, true) }
+                            .orEmpty()
                     )
                 )
             }

@@ -4,10 +4,7 @@ import android.util.Log
 import com.secondbrain.app.ai.EmbedderEngine
 import com.secondbrain.app.ai.LlmEngine
 import com.secondbrain.app.data.BrainStore
-import com.secondbrain.app.data.EntityNode
-import com.secondbrain.app.data.ExtractedKnowledge
 import com.secondbrain.app.data.NoteDocument
-import com.secondbrain.app.data.RelationEdge
 import com.secondbrain.app.data.TranscriptionStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -17,7 +14,8 @@ data class IngestionResult(
     val note: NoteDocument,
     val entitiesExtracted: Int,
     val relationsExtracted: Int,
-    val vectorDimension: Int
+    val vectorDimension: Int,
+    val reviewsCreated: Int = 0
 )
 
 class IngestionPipeline(
@@ -25,6 +23,7 @@ class IngestionPipeline(
     private val embedder: EmbedderEngine,
     private val llm: LlmEngine
 ) {
+    private val resolver = KnowledgeResolver()
 
     /** Persists the user's original note before any AI work begins. */
     suspend fun capture(
@@ -85,19 +84,33 @@ class IngestionPipeline(
             // Step 2: Extract Entities & Relations
             val extracted = llm.extractOntology(note.content)
 
-            // Step 3: Entity Resolution (deduplication against existing nodes)
-            val resolved = resolveEntities(extracted)
+            // Step 3: Trust-aware entity resolution. Only supported, high-confidence
+            // knowledge enters the graph; ambiguous proposals go to the review inbox.
+            val resolution = resolver.resolve(
+                note = note,
+                raw = extracted,
+                existing = store.getAllEntities().getOrDefault(emptyList()),
+                acceptedAliases = store.getAcceptedAliasMap().getOrDefault(emptyMap())
+            )
 
-            // Step 4: Atomic storage in CozoDB
-            store.putNote(note, resolved, embedding).getOrThrow()
+            // Step 4: Replace stale pending proposals for this note, then persist the
+            // accepted graph and its fresh review proposals.
+            store.removePendingKnowledgeReviews(note.id).getOrThrow()
+            store.putNote(note, resolution.accepted, embedding).getOrThrow()
+            store.putKnowledgeReviews(resolution.reviews).getOrThrow()
 
-            Log.i(TAG, "Ingested note '${note.title}' with ${resolved.entities.size} entities, ${resolved.relations.size} edges")
+            Log.i(
+                TAG,
+                "Ingested note '${note.title}' with ${resolution.accepted.entities.size} entities, " +
+                    "${resolution.accepted.relations.size} edges, ${resolution.reviews.size} reviews"
+            )
 
             IngestionResult(
                 note = note,
-                entitiesExtracted = resolved.entities.size,
-                relationsExtracted = resolved.relations.size,
-                vectorDimension = embedding.size
+                entitiesExtracted = resolution.accepted.entities.size,
+                relationsExtracted = resolution.accepted.relations.size,
+                vectorDimension = embedding.size,
+                reviewsCreated = resolution.reviews.size
             )
         }
     }
@@ -110,38 +123,6 @@ class IngestionPipeline(
     ): Result<IngestionResult> = runCatching {
         val note = capture(title, content, source).getOrThrow()
         enrich(note).getOrThrow()
-    }
-
-    private suspend fun resolveEntities(raw: ExtractedKnowledge): ExtractedKnowledge {
-        val existing = store.getAllEntities().getOrDefault(emptyList())
-        val existingMap = existing.associateBy { it.name.lowercase().trim() }
-
-        val resolvedEntities = mutableListOf<EntityNode>()
-        val nameMapping = mutableMapOf<String, String>()
-
-        for (e in raw.entities) {
-            val key = e.name.lowercase().trim()
-            val match = existingMap[key]
-            if (match != null) {
-                // Reuse canonical existing entity name
-                resolvedEntities.add(match)
-                nameMapping[e.name] = match.name
-            } else {
-                resolvedEntities.add(e)
-                nameMapping[e.name] = e.name
-            }
-        }
-
-        val resolvedRelations = raw.relations.map { r ->
-            RelationEdge(
-                source = nameMapping[r.source] ?: r.source,
-                relation = r.relation,
-                target = nameMapping[r.target] ?: r.target,
-                timestamp = r.timestamp
-            )
-        }
-
-        return ExtractedKnowledge(resolvedEntities.distinctBy { it.name }, resolvedRelations.distinct())
     }
 
     companion object {

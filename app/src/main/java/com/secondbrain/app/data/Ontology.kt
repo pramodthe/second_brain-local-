@@ -51,18 +51,37 @@ enum class TranscriptionStatus {
     }
 }
 
+enum class KnowledgeStatus {
+    ACCEPTED,
+    REJECTED;
+
+    companion object {
+        fun fromString(value: String): KnowledgeStatus =
+            entries.firstOrNull { it.name.equals(value, ignoreCase = true) } ?: ACCEPTED
+    }
+}
+
 data class EntityNode(
     val name: String,
     val category: EntityCategory,
     val description: String = "",
-    val timestamp: Double = System.currentTimeMillis() / 1000.0
+    val timestamp: Double = System.currentTimeMillis() / 1000.0,
+    val aliases: List<String> = emptyList(),
+    val confidence: Double = 1.0,
+    val evidence: String = "",
+    val sourceNoteId: String = "",
+    val status: KnowledgeStatus = KnowledgeStatus.ACCEPTED
 )
 
 data class RelationEdge(
     val source: String,
     val relation: RelationType,
     val target: String,
-    val timestamp: Double = System.currentTimeMillis() / 1000.0
+    val timestamp: Double = System.currentTimeMillis() / 1000.0,
+    val confidence: Double = 1.0,
+    val evidence: String = "",
+    val sourceNoteId: String = "",
+    val status: KnowledgeStatus = KnowledgeStatus.ACCEPTED
 )
 
 data class NoteDocument(

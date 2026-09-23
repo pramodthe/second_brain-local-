@@ -22,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.LibraryBooks
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.FactCheck
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -38,6 +39,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.secondbrain.app.data.EntityCategory
 import com.secondbrain.app.data.EntityNode
+import com.secondbrain.app.data.KnowledgeReviewItem
+import com.secondbrain.app.data.ReviewKind
 import com.secondbrain.app.data.NoteDocument
 import com.secondbrain.app.data.ProcessingJob
 import com.secondbrain.app.data.ProcessingJobStatus
@@ -81,7 +84,7 @@ fun BrainApp(viewModel: BrainViewModel) {
                             text = when (selectedTab) {
                                 BrainTab.NOTES -> "Second Brain"
                                 BrainTab.EXPLORE -> "Explore connections"
-                                BrainTab.PROCESSING -> "Processing"
+                                BrainTab.PROCESSING -> "Tasks & review"
                                 BrainTab.ASK -> "Ask your notes"
                             },
                             fontWeight = FontWeight.SemiBold
@@ -90,7 +93,7 @@ fun BrainApp(viewModel: BrainViewModel) {
                             text = when (selectedTab) {
                                 BrainTab.NOTES -> "Your private knowledge library"
                                 BrainTab.EXPLORE -> "See how your ideas connect"
-                                BrainTab.PROCESSING -> "Reliable on-device background work"
+                                BrainTab.PROCESSING -> "Processing you can trust and verify"
                                 BrainTab.ASK -> "Answers grounded in your knowledge"
                             },
                             style = MaterialTheme.typography.labelMedium,
@@ -648,11 +651,13 @@ private fun NoteComposerSheet(
 @Composable
 fun ProcessingScreen(viewModel: BrainViewModel) {
     val jobs by viewModel.processingJobs.collectAsState()
+    val reviews by viewModel.knowledgeReviews.collectAsState()
     val notes by viewModel.notes.collectAsState()
     val notesById = remember(notes) { notes.associateBy { it.id } }
     val activeCount = jobs.count { it.status.isActive }
     val failedCount = jobs.count { it.status == ProcessingJobStatus.FAILED }
     val completedCount = jobs.count { it.status == ProcessingJobStatus.COMPLETED }
+    var showReviews by rememberSaveable { mutableStateOf(false) }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -660,17 +665,52 @@ fun ProcessingScreen(viewModel: BrainViewModel) {
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                LibraryStat("Active", activeCount, Icons.Default.Sync, Modifier.weight(1f))
-                LibraryStat("Done", completedCount, Icons.Default.CheckCircle, Modifier.weight(1f))
-                LibraryStat("Failed", failedCount, Icons.Default.ErrorOutline, Modifier.weight(1f))
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = !showReviews,
+                        onClick = { showReviews = false },
+                        leadingIcon = { Icon(Icons.Default.Sync, null, Modifier.size(18.dp)) },
+                        label = { Text("Processing") }
+                    )
+                    FilterChip(
+                        selected = showReviews,
+                        onClick = { showReviews = true },
+                        leadingIcon = { Icon(Icons.AutoMirrored.Filled.FactCheck, null, Modifier.size(18.dp)) },
+                        label = { Text("Review${if (reviews.isNotEmpty()) " (${reviews.size})" else ""}") }
+                    )
+                }
+                if (!showReviews) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        LibraryStat("Active", activeCount, Icons.Default.Sync, Modifier.weight(1f))
+                        LibraryStat("Done", completedCount, Icons.Default.CheckCircle, Modifier.weight(1f))
+                        LibraryStat("Failed", failedCount, Icons.Default.ErrorOutline, Modifier.weight(1f))
+                    }
+                } else {
+                    Surface(
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.VerifiedUser, null)
+                            Spacer(Modifier.width(12.dp))
+                            Column {
+                                Text("${reviews.size} waiting for you", fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "Only accepted facts become part of your knowledge graph.",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        item {
+        if (!showReviews) item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -690,7 +730,7 @@ fun ProcessingScreen(viewModel: BrainViewModel) {
             }
         }
 
-        if (jobs.isEmpty()) {
+        if (!showReviews && jobs.isEmpty()) {
             item {
                 Column(
                     modifier = Modifier.fillMaxWidth().padding(vertical = 64.dp),
@@ -713,7 +753,7 @@ fun ProcessingScreen(viewModel: BrainViewModel) {
                     )
                 }
             }
-        } else {
+        } else if (!showReviews) {
             items(jobs, key = { it.id }) { job ->
                 ProcessingJobCard(
                     job = job,
@@ -721,6 +761,125 @@ fun ProcessingScreen(viewModel: BrainViewModel) {
                     onRetry = { viewModel.retryProcessingJob(job) },
                     onCancel = { viewModel.cancelProcessingJob(job) }
                 )
+            }
+        } else if (reviews.isEmpty()) {
+            item {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 64.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Surface(
+                        modifier = Modifier.size(72.dp),
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.tertiaryContainer
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(Icons.Default.Verified, null, Modifier.size(32.dp))
+                        }
+                    }
+                    Spacer(Modifier.height(16.dp))
+                    Text("Your graph is reviewed", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Uncertain entities and relationships will appear here.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        } else {
+            items(reviews, key = { it.id }) { item ->
+                KnowledgeReviewCard(
+                    item = item,
+                    note = notesById[item.noteId],
+                    onAccept = { viewModel.acceptKnowledgeReview(item) },
+                    onReject = { viewModel.rejectKnowledgeReview(item) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun KnowledgeReviewCard(
+    item: KnowledgeReviewItem,
+    note: NoteDocument?,
+    onAccept: () -> Unit,
+    onReject: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(shape = CircleShape, color = MaterialTheme.colorScheme.secondaryContainer) {
+                    Icon(
+                        when (item.kind) {
+                            ReviewKind.ENTITY -> Icons.Default.Category
+                            ReviewKind.RELATION -> Icons.Default.Share
+                            ReviewKind.DUPLICATE -> Icons.Default.ContentCopy
+                        },
+                        contentDescription = null,
+                        modifier = Modifier.padding(10.dp).size(20.dp)
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(item.kind.label, style = MaterialTheme.typography.labelMedium)
+                    Text(
+                        when (item.kind) {
+                            ReviewKind.ENTITY -> item.subject
+                            ReviewKind.RELATION -> "${item.subject} → ${item.candidate}"
+                            ReviewKind.DUPLICATE -> "${item.subject} = ${item.candidate}?"
+                        },
+                        fontWeight = FontWeight.SemiBold,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
+                AssistChip(
+                    onClick = {},
+                    label = { Text("${(item.confidence * 100).toInt()}%") },
+                    leadingIcon = { Icon(Icons.Default.Analytics, null, Modifier.size(16.dp)) }
+                )
+            }
+
+            Text(
+                "${item.schemaType.replace('_', ' ').lowercase().replaceFirstChar { it.uppercase() }} · ${note?.let(::noteDisplayTitle) ?: "Source note"}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (item.description.isNotBlank()) {
+                Text(item.description, style = MaterialTheme.typography.bodyMedium)
+            }
+            if (item.aliases.isNotEmpty()) {
+                Text(
+                    "Aliases: ${item.aliases.joinToString()}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (item.evidence.isNotBlank()) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("Evidence from note", style = MaterialTheme.typography.labelSmall)
+                        Spacer(Modifier.height(4.dp))
+                        Text("“${item.evidence}”", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End)
+            ) {
+                OutlinedButton(onClick = onReject) { Text("Reject") }
+                Button(onClick = onAccept) {
+                    Icon(Icons.Default.Check, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Accept")
+                }
             }
         }
     }
@@ -828,7 +987,8 @@ fun GraphScreen(viewModel: BrainViewModel) {
         entities.filter { entity ->
             (selectedCategory == null || entity.category == selectedCategory) &&
                 (searchQuery.isBlank() || entity.name.contains(searchQuery.trim(), ignoreCase = true) ||
-                    entity.description.contains(searchQuery.trim(), ignoreCase = true))
+                    entity.description.contains(searchQuery.trim(), ignoreCase = true) ||
+                    entity.aliases.any { it.contains(searchQuery.trim(), ignoreCase = true) })
         }
     }
     val visibleNames = remember(visibleEntities) { visibleEntities.map { normalizeGraphName(it.name) }.toSet() }
@@ -964,7 +1124,8 @@ fun EntityItem(entity: EntityNode, connections: List<RelationEdge> = emptyList()
                 Column(modifier = Modifier.weight(1f)) {
                     Text(entity.name, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "${entity.category.label} · ${connections.size} ${if (connections.size == 1) "connection" else "connections"}",
+                        "${entity.category.label} · ${(entity.confidence * 100).toInt()}% confidence · " +
+                            "${connections.size} ${if (connections.size == 1) "connection" else "connections"}",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -981,6 +1142,27 @@ fun EntityItem(entity: EntityNode, connections: List<RelationEdge> = emptyList()
                         Spacer(Modifier.height(12.dp))
                         Text(entity.description, style = MaterialTheme.typography.bodyMedium)
                     }
+                    if (entity.aliases.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Also known as ${entity.aliases.joinToString()}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    if (entity.evidence.isNotBlank()) {
+                        Spacer(Modifier.height(10.dp))
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text(
+                                "Evidence: “${entity.evidence}”",
+                                modifier = Modifier.padding(10.dp),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
                     if (connections.isNotEmpty()) {
                         Spacer(Modifier.height(12.dp))
                         HorizontalDivider()
@@ -994,6 +1176,15 @@ fun EntityItem(entity: EntityNode, connections: List<RelationEdge> = emptyList()
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(vertical = 3.dp)
                             )
+                            if (edge.evidence.isNotBlank()) {
+                                Text(
+                                    "${(edge.confidence * 100).toInt()}% · “${edge.evidence}”",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.outline,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
                     }
                 }
