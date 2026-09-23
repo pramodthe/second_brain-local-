@@ -10,6 +10,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -37,8 +38,18 @@ enum class BrainTab(val label: String) {
 fun BrainApp(viewModel: BrainViewModel) {
     var selectedTab by remember { mutableStateOf(BrainTab.NOTES) }
     val stats by viewModel.stats.collectAsState()
+    val appError by viewModel.appError.collectAsState()
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(appError) {
+        appError?.let {
+            snackbarHostState.showSnackbar(it)
+            viewModel.clearAppError()
+        }
+    }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = {
@@ -229,7 +240,7 @@ fun GraphScreen(viewModel: BrainViewModel) {
                     FilterChip(
                         selected = !isCanvasView,
                         onClick = { isCanvasView = false },
-                        leadingIcon = { Icon(Icons.Default.List, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                        leadingIcon = { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null, modifier = Modifier.size(16.dp)) },
                         label = { Text("List") }
                     )
                 }
@@ -368,8 +379,59 @@ fun ChatScreen(viewModel: BrainViewModel) {
     var queryText by remember { mutableStateOf("") }
     val messages by viewModel.chatMessages.collectAsState()
     val isGenerating by viewModel.isGenerating.collectAsState()
+    val modelReady by viewModel.modelReady.collectAsState()
+    val modelLoaded by viewModel.modelLoaded.collectAsState()
+    val isModelBusy by viewModel.isModelBusy.collectAsState()
+    val modelProgress by viewModel.modelDownloadProgress.collectAsState()
+    val modelError by viewModel.modelError.collectAsState()
 
     Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
+        if (!modelLoaded) {
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Text("Local AI model", fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        if (modelReady) {
+                            "Qwen3.5 9B is installed and ready to load on the GPU."
+                        } else {
+                            "Install the 5.7 GB Qwen3.5 9B model for private, on-device GPU answers. Search and graph retrieval work without it."
+                        },
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (isModelBusy && !modelReady) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        LinearProgressIndicator(
+                            progress = { modelProgress / 100f },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text("Downloading: $modelProgress%", fontSize = 12.sp)
+                    }
+                    modelError?.let {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = viewModel::setupLocalModel,
+                        enabled = !isModelBusy
+                    ) {
+                        if (isModelBusy) {
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(if (modelReady) "Loading..." else "Downloading...")
+                        } else {
+                            Text(if (modelReady) "Load model" else "Download model")
+                        }
+                    }
+                }
+            }
+        }
+
         LazyColumn(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(10.dp)

@@ -34,7 +34,7 @@ data class ModelInfo(
     val name: String,
     val filename: String,
     val repo: String,
-    val approxMb: Int
+    val expectedBytes: Long
 ) {
     val downloadUrl: String get() = "https://huggingface.co/$repo/resolve/main/$filename"
 }
@@ -45,10 +45,10 @@ class LlmEngine(private val context: Context) {
     private var sdkInitialized = false
 
     val defaultModel = ModelInfo(
-        name = "Qwen3-0.6B",
-        filename = "Qwen3-0.6B-Q4_0.gguf",
-        repo = "unsloth/Qwen3-0.6B-GGUF",
-        approxMb = 364
+        name = "Qwen3.5-9B",
+        filename = "Qwen3.5-9B-Q4_K_M.gguf",
+        repo = "unsloth/Qwen3.5-9B-GGUF",
+        expectedBytes = 5_680_522_464L
     )
 
     val modelDir: File
@@ -57,7 +57,7 @@ class LlmEngine(private val context: Context) {
     val modelFile: File
         get() = File(modelDir, defaultModel.filename)
 
-    fun isModelReady(): Boolean = modelFile.exists() && modelFile.length() > defaultModel.approxMb * 900_000L
+    fun isModelReady(): Boolean = modelFile.isFile && modelFile.length() == defaultModel.expectedBytes
 
     fun isEngineLoaded(): Boolean = llm != null
 
@@ -83,19 +83,24 @@ class LlmEngine(private val context: Context) {
         }
     }
 
-    suspend fun loadModel(onCpuOnly: Boolean = true): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun loadModel(useGpu: Boolean = true): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             if (llm != null) return@runCatching Unit
             if (!isModelReady()) error("Model file not found at ${modelFile.absolutePath}")
 
             check(ensureSdkInit()) { "Failed to initialize Nexa SDK" }
 
-            val dev = if (onCpuOnly) DeviceIdValue.CPU else DeviceIdValue.GPU
+            val dev = if (useGpu) DeviceIdValue.GPU else DeviceIdValue.CPU
             val input = LlmCreateInput(
-                defaultModel.name,
+                "",
                 modelFile.absolutePath,
                 null,
-                ModelConfig(nCtx = 2048, enable_thinking = false),
+                ModelConfig(
+                    nCtx = 4_096,
+                    nGpuLayers = if (useGpu) 999 else 0,
+                    enable_thinking = false,
+                    verbose = true
+                ),
                 PluginIdValue.CPU_GPU.value,
                 dev.value
             )
@@ -106,7 +111,7 @@ class LlmEngine(private val context: Context) {
                 .getOrThrow()
 
             llm = instance
-            Log.i(TAG, "LLM loaded successfully on ${dev.name}")
+            Log.i(TAG, "${defaultModel.name} loaded on ${dev.name}")
             Unit
         }
     }
@@ -137,7 +142,7 @@ class LlmEngine(private val context: Context) {
             val append = have > 0 && responseCode == HttpURLConnection.HTTP_PARTIAL
             val startingBytes = if (append) have else 0L
             val total = conn.contentLengthLong.let {
-                if (it > 0) it + startingBytes else defaultModel.approxMb * 1_048_576L
+                if (it > 0) it + startingBytes else defaultModel.expectedBytes
             }
             conn.inputStream.use { input ->
                 java.io.FileOutputStream(part, append).use { out ->
@@ -158,6 +163,9 @@ class LlmEngine(private val context: Context) {
                 }
             }
             conn.disconnect()
+            check(part.length() == defaultModel.expectedBytes) {
+                "Model download has an unexpected size (${part.length()} of ${defaultModel.expectedBytes} bytes)"
+            }
             check(part.renameTo(target)) { "Failed to rename part to target file" }
             Unit
         }

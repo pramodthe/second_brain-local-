@@ -54,13 +54,32 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
 
+    private val _appError = MutableStateFlow<String?>(null)
+    val appError: StateFlow<String?> = _appError.asStateFlow()
+
+    private val _modelReady = MutableStateFlow(llm.isModelReady())
+    val modelReady: StateFlow<Boolean> = _modelReady.asStateFlow()
+
+    private val _modelLoaded = MutableStateFlow(false)
+    val modelLoaded: StateFlow<Boolean> = _modelLoaded.asStateFlow()
+
+    private val _isModelBusy = MutableStateFlow(false)
+    val isModelBusy: StateFlow<Boolean> = _isModelBusy.asStateFlow()
+
+    private val _modelDownloadProgress = MutableStateFlow(0)
+    val modelDownloadProgress: StateFlow<Int> = _modelDownloadProgress.asStateFlow()
+
+    private val _modelError = MutableStateFlow<String?>(null)
+    val modelError: StateFlow<String?> = _modelError.asStateFlow()
+
     init {
         viewModelScope.launch {
             store.open()
-            refreshData()
-            // Attempt to load LLM in background if model file is already present
-            if (llm.isModelReady()) {
-                llm.loadModel(onCpuOnly = true)
+                .onSuccess { refreshData() }
+                .onFailure { _appError.value = "Could not open the local knowledge database: ${it.message}" }
+
+            if (_modelReady.value) {
+                loadLocalModel()
             }
         }
     }
@@ -82,10 +101,47 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
                 pipeline.ingest(title, content).getOrThrow()
                 refreshData()
                 onComplete()
+            } catch (error: Exception) {
+                _appError.value = "Could not save the note: ${error.message ?: "unknown error"}"
             } finally {
                 _isIngesting.value = false
             }
         }
+    }
+
+    fun setupLocalModel() {
+        if (_isModelBusy.value || _modelLoaded.value) return
+        viewModelScope.launch {
+            _isModelBusy.value = true
+            _modelError.value = null
+            try {
+                if (!llm.isModelReady()) {
+                    llm.downloadModel { progress -> _modelDownloadProgress.value = progress }
+                        .getOrThrow()
+                    _modelReady.value = true
+                }
+                llm.loadModel(useGpu = true).getOrThrow()
+                _modelLoaded.value = true
+            } catch (error: Exception) {
+                _modelReady.value = llm.isModelReady()
+                _modelError.value = error.message ?: "Unknown model setup error"
+            } finally {
+                _isModelBusy.value = false
+            }
+        }
+    }
+
+    private suspend fun loadLocalModel() {
+        _isModelBusy.value = true
+        _modelError.value = null
+        llm.loadModel(useGpu = true)
+            .onSuccess { _modelLoaded.value = true }
+            .onFailure { _modelError.value = it.message ?: "Could not load the local model" }
+        _isModelBusy.value = false
+    }
+
+    fun clearAppError() {
+        _appError.value = null
     }
 
     fun askQuestion(query: String) {

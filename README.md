@@ -31,6 +31,7 @@ Question -> query embedding -> similar notes -> graph expansion -> local LLM ans
 - Android Studio with Android SDK Platform 35.
 - JDK 17.
 - An Android 9 (API 28) or newer `arm64-v8a` device or emulator.
+- A high-memory Android device for the default 9B model; the tested device has 16 GB RAM.
 - A connected device and Android Platform Tools for installation and probe commands.
 
 The app is packaged only for `arm64-v8a`, because its on-device dependencies include native libraries.
@@ -54,7 +55,9 @@ sdk.dir=/absolute/path/to/Android/sdk
 
 ## On-device model
 
-The app can download and run the configured Qwen 0.6B GGUF model locally. The model is stored under the app’s private files directory and is intentionally excluded from source control. Without it, capture, graph storage, search, and rule-based extraction continue to work; chat presents the retrieved graph context instead of generating an LLM response.
+The default model is [Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF), using the `Q4_K_M` quantization (5,680,522,464 bytes). The app downloads it into private app storage and runs it through Nexa SDK 0.0.24 with the OpenCL GPU backend. Model files are intentionally excluded from source control.
+
+This is a demanding mobile configuration. On the tested RMX5011/Snapdragon 8 Elite device with 16 GB RAM, the model loaded in roughly 23 seconds and Nexa reported about 10.2 prompt tokens/second and 2.7 generated tokens/second. Performance and memory use vary by device and runtime. Without the model, capture, graph storage, search, and rule-based extraction continue to work; chat presents retrieved graph context instead of generating an LLM response.
 
 ## Verify on a device
 
