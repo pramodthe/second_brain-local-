@@ -46,7 +46,7 @@ class SpeechEngine(private val context: Context) {
 
     fun isModelReady(): Boolean = modelFile.isFile && modelFile.length() == MODEL_BYTES
 
-    suspend fun downloadModel(onProgress: (Int) -> Unit): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun downloadModel(onProgress: suspend (Int) -> Unit): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             if (isModelReady()) return@runCatching Unit
             val target = modelFile

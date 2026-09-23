@@ -9,6 +9,7 @@ An offline-first Android knowledge workspace that turns notes and shared text in
 - Capture notes in the app or share plain text from another Android app.
 - Record voice notes, preserve the original audio, play it back, and transcribe it fully offline.
 - Save raw notes immediately, edit them later, and retain created/modified timestamps.
+- Continue transcription and knowledge extraction through a durable background queue after restarts.
 - Store notes, entities, and relationships locally in CozoDB.
 - Retrieve relevant notes with HNSW vector search, then expand related graph context.
 - Explore the ontology with an interactive force-directed graph or a filtered list.
@@ -18,9 +19,12 @@ An offline-first Android knowledge workspace that turns notes and shared text in
 ## Architecture
 
 ```text
-Text / share sheet ---------> durable note --------> embeddings ----> CozoDB HNSW index
-                                  ^                       |
-Voice ----> durable WAV ----> offline transcript          +----> entities + relationships
+Text / share sheet ---------> durable note ----> persistent job queue ----> embeddings
+                                  ^                  |                         |
+Voice ----> durable WAV ----> offline transcript <---+                         v
+                                                                       CozoDB HNSW index
+                                                                              |
+                                                entities + relationships <-----+
                                                                          |
                                                                          v
                                                                   knowledge graph
@@ -34,7 +38,7 @@ Capture is intentionally durable-first. Original text or audio is written to pri
 
 - **Phase 1 — Capture foundation (complete):** instant text capture, optional titles, editing, timestamps, and background organization.
 - **Phase 2 — Voice capture (complete):** durable recordings, playback, offline transcription, visible processing state, and retry.
-- **Phase 3 — Processing queue:** persistent, resumable AI jobs with visible status and retries.
+- **Phase 3 — Processing queue (complete):** persistent, resumable AI jobs with visible status, retries, cancellation, and deduplication.
 - **Phase 4 — Knowledge quality:** aliases, duplicate resolution, evidence, confidence, and review workflows.
 - **Phase 5 — Retrieval:** stronger search, related notes, timelines, and source-grounded answers.
 - **Phase 6 — Ownership:** encrypted export, backup, restore, and production hardening.
@@ -81,6 +85,12 @@ Voice notes use Nexa SDK 0.0.24's `whisper.cpp` backend with the multilingual Wh
 
 The engine tries NPU, GPU, and CPU in that order. On the tested RMX5011/Snapdragon 8 Elite, Nexa loaded the model on the NPU and transcribed the synthetic device test correctly. Speech recognition does not upload recordings. Whisper Tiny is the Phase 2 baseline; the `SpeechEngine` boundary keeps a later Qualcomm Voice AI or larger-model upgrade isolated from the capture and note-storage layers.
 
+## Reliable background processing
+
+Every transcription and ontology-extraction request is first persisted in CozoDB. Android WorkManager then drains this queue serially so only one heavy on-device inference task runs at a time. Stable job IDs deduplicate repeated requests, while a note edited during processing supersedes the older run and is processed again with its latest contents.
+
+The **Tasks** screen shows queued, running, completed, failed, and cancelled work with progress and attempt counts. Failed or cancelled jobs can be retried; active jobs can be cancelled cooperatively. If Android terminates the process, any interrupted job returns to the queue when WorkManager or the app starts again.
+
 ## Verify on a device
 
 After installing a debug build, run the diagnostic receiver:
@@ -102,6 +112,16 @@ adb shell am broadcast \
 adb logcat -d -s BrainProbe:V SpeechEngine:V
 ```
 
+To enqueue an organization job for an existing diagnostic note and verify the persistent worker:
+
+```bash
+adb shell am broadcast \
+  -a com.secondbrain.app.PROBE \
+  -n com.secondbrain.app/.probe.BrainProbeReceiver \
+  --ez queue_only true
+adb logcat -d -s BrainProbe:V BrainProcessing:V WM-WorkerWrapper:V
+```
+
 ## Project layout
 
 ```text
@@ -110,7 +130,8 @@ app/src/main/java/com/secondbrain/app/
 ├── data/     # CozoDB store and ontology data types
 ├── domain/   # Ingestion and hybrid retrieval workflows
 ├── probe/    # ADB diagnostic receiver
-└── ui/       # Jetpack Compose screens and state holder
+├── ui/       # Jetpack Compose screens and state holder
+└── work/     # Persistent WorkManager queue runner
 ```
 
 ## Privacy and security notes

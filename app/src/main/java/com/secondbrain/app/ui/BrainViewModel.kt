@@ -5,6 +5,7 @@ import android.media.MediaPlayer
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.secondbrain.app.SecondBrainApplication
 import com.secondbrain.app.ai.EmbedderEngine
 import com.secondbrain.app.ai.LlmEngine
 import com.secondbrain.app.ai.SpeechEngine
@@ -12,19 +13,22 @@ import com.secondbrain.app.ai.VoiceRecorder
 import com.secondbrain.app.data.BrainStore
 import com.secondbrain.app.data.EntityNode
 import com.secondbrain.app.data.NoteDocument
+import com.secondbrain.app.data.ProcessingJob
+import com.secondbrain.app.data.ProcessingJobStatus
+import com.secondbrain.app.data.ProcessingJobType
 import com.secondbrain.app.data.RelationEdge
 import com.secondbrain.app.data.SubgraphContext
 import com.secondbrain.app.data.TranscriptionStatus
 import com.secondbrain.app.domain.HybridRetriever
 import com.secondbrain.app.domain.IngestionPipeline
+import com.secondbrain.app.work.ProcessingWorkScheduler
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 
 data class ChatMessageItem(
     val sender: String, // "user" or "brain"
@@ -35,16 +39,15 @@ data class ChatMessageItem(
 
 class BrainViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val noteProcessingMutex = Mutex()
-    private val speechProcessingMutex = Mutex()
     private val voiceRecorder = VoiceRecorder(application)
     private var recordingTickerJob: Job? = null
     private var mediaPlayer: MediaPlayer? = null
 
     val store = BrainStore(application)
     val embedder = EmbedderEngine(application)
-    val llm = LlmEngine(application)
-    val speech = SpeechEngine(application)
+    private val secondBrainApplication = application as SecondBrainApplication
+    val llm: LlmEngine = secondBrainApplication.llmEngine
+    val speech: SpeechEngine = secondBrainApplication.speechEngine
 
     val pipeline = IngestionPipeline(store, embedder, llm)
     val retriever = HybridRetriever(store, embedder)
@@ -73,6 +76,9 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
     private val _speechProcessingNoteIds = MutableStateFlow<Set<String>>(emptySet())
     val speechProcessingNoteIds: StateFlow<Set<String>> = _speechProcessingNoteIds.asStateFlow()
 
+    private val _processingJobs = MutableStateFlow<List<ProcessingJob>>(emptyList())
+    val processingJobs: StateFlow<List<ProcessingJob>> = _processingJobs.asStateFlow()
+
     private val _isRecording = MutableStateFlow(false)
     val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
 
@@ -87,9 +93,6 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _speechDownloadProgress = MutableStateFlow(0)
     val speechDownloadProgress: StateFlow<Int> = _speechDownloadProgress.asStateFlow()
-
-    private val _speechLoadedDevice = MutableStateFlow<String?>(null)
-    val speechLoadedDevice: StateFlow<String?> = _speechLoadedDevice.asStateFlow()
 
     private val _playingNoteId = MutableStateFlow<String?>(null)
     val playingNoteId: StateFlow<String?> = _playingNoteId.asStateFlow()
@@ -120,7 +123,8 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
             store.open()
                 .onSuccess {
                     loadData()
-                    resumePendingTranscriptions()
+                    bootstrapProcessingQueue()
+                    monitorProcessingQueue()
                 }
                 .onFailure { _appError.value = "Could not open the local knowledge database: ${it.message}" }
 
@@ -176,22 +180,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
                 _isIngesting.value = false
             }
 
-            savedNote?.let { processNote(it) }
-        }
-    }
-
-    private suspend fun processNote(note: NoteDocument) {
-        _processingNoteIds.value = _processingNoteIds.value + note.id
-        try {
-            noteProcessingMutex.withLock {
-                pipeline.enrich(note)
-                    .onSuccess { refreshData() }
-                    .onFailure { error ->
-                        _appError.value = "Note saved, but automatic organization failed: ${error.message ?: "unknown error"}"
-                    }
-            }
-        } finally {
-            _processingNoteIds.value = _processingNoteIds.value - note.id
+            savedNote?.let { enqueueJob(it.id, ProcessingJobType.ORGANIZE) }
         }
     }
 
@@ -242,7 +231,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
                 _isVoiceCaptureBusy.value = false
                 recordingTickerJob?.cancel()
             }
-            savedNote?.let { processVoiceNote(it) }
+            savedNote?.let { enqueueJob(it.id, ProcessingJobType.TRANSCRIBE) }
         }
     }
 
@@ -253,11 +242,12 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun retryTranscription(note: NoteDocument) {
-        if (note.audioPath.isNullOrBlank() || note.id in _speechProcessingNoteIds.value) return
-        viewModelScope.launch { processVoiceNote(note) }
+        if (note.audioPath.isNullOrBlank()) return
+        viewModelScope.launch { enqueueJob(note.id, ProcessingJobType.TRANSCRIBE) }
     }
 
-    private fun resumePendingTranscriptions() {
+    private suspend fun bootstrapProcessingQueue() {
+        var queuedMigration = false
         _notes.value
             .filter {
                 it.audioPath != null && it.transcriptionStatus in setOf(
@@ -266,70 +256,91 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
                     TranscriptionStatus.TRANSCRIBING
                 )
             }
-            .forEach { note -> viewModelScope.launch { processVoiceNote(note) } }
-    }
-
-    private suspend fun processVoiceNote(original: NoteDocument) {
-        if (original.id in _speechProcessingNoteIds.value) return
-        _speechProcessingNoteIds.value = _speechProcessingNoteIds.value + original.id
-        var workingNote = original
-        var completedNote: NoteDocument? = null
-        try {
-            speechProcessingMutex.withLock {
-                val audioFile = java.io.File(requireNotNull(workingNote.audioPath))
-                check(audioFile.isFile) { "The original recording is missing" }
-
-                if (!speech.isModelReady()) {
-                    workingNote = updateVoiceStatus(workingNote, TranscriptionStatus.DOWNLOADING)
-                    speech.downloadModel { progress -> _speechDownloadProgress.value = progress }
-                        .getOrThrow()
-                    _speechModelReady.value = true
-                }
-
-                _speechLoadedDevice.value = speech.load().getOrThrow()
-                workingNote = updateVoiceStatus(workingNote, TranscriptionStatus.TRANSCRIBING)
-                val transcript = speech.transcribe(audioFile).getOrThrow()
-                check(transcript.text.isNotBlank()) { "No speech was detected in this recording" }
-
-                val completed = workingNote.copy(
-                    content = transcript.text,
-                    audioDurationMs = transcript.audioDurationMs.takeIf { it > 0L }
-                        ?: workingNote.audioDurationMs,
-                    modifiedTimestamp = System.currentTimeMillis() / 1000.0,
-                    transcriptionStatus = TranscriptionStatus.COMPLETE
-                )
-                store.putNote(completed).getOrThrow()
-                replaceNote(completed)
-                completedNote = completed
+            .forEach { note ->
+                store.enqueueProcessingJob(note.id, ProcessingJobType.TRANSCRIBE)
+                    .onSuccess { queuedMigration = true }
             }
-        } catch (error: Exception) {
-            val failed = workingNote.copy(
-                transcriptionStatus = TranscriptionStatus.FAILED,
-                modifiedTimestamp = System.currentTimeMillis() / 1000.0
-            )
-            store.putNote(failed)
-            replaceNote(failed)
-            _appError.value = "Voice note saved, but transcription failed: ${error.message ?: "unknown error"}"
-        } finally {
-            _speechProcessingNoteIds.value = _speechProcessingNoteIds.value - original.id
-            refreshData()
+
+        val jobs = refreshProcessingJobs()
+        if (queuedMigration || jobs.any { it.status.isActive }) {
+            ProcessingWorkScheduler.kick(getApplication())
         }
-
-        completedNote?.let { processNote(it) }
     }
 
-    private suspend fun updateVoiceStatus(
-        note: NoteDocument,
-        status: TranscriptionStatus
-    ): NoteDocument {
-        val updated = note.copy(transcriptionStatus = status)
-        store.putNote(updated).getOrThrow()
-        replaceNote(updated)
-        return updated
+    private fun monitorProcessingQueue() {
+        viewModelScope.launch {
+            var previousFingerprint = ""
+            while (isActive) {
+                val jobs = refreshProcessingJobs()
+                val fingerprint = jobs.joinToString("|") {
+                    "${it.id}:${it.status}:${it.progress}:${it.updatedTimestamp}"
+                }
+                if (fingerprint != previousFingerprint) {
+                    previousFingerprint = fingerprint
+                    loadData()
+                }
+                _speechModelReady.value = speech.isModelReady()
+                delay(PROCESSING_POLL_MS)
+            }
+        }
     }
 
-    private fun replaceNote(note: NoteDocument) {
-        _notes.value = _notes.value.map { if (it.id == note.id) note else it }
+    private suspend fun refreshProcessingJobs(): List<ProcessingJob> {
+        val jobs = store.getProcessingJobs(100).getOrDefault(emptyList())
+        _processingJobs.value = jobs
+        _processingNoteIds.value = jobs
+            .filter { it.status.isActive && it.type == ProcessingJobType.ORGANIZE }
+            .mapTo(mutableSetOf()) { it.noteId }
+        _speechProcessingNoteIds.value = jobs
+            .filter { it.status.isActive && it.type == ProcessingJobType.TRANSCRIBE }
+            .mapTo(mutableSetOf()) { it.noteId }
+        _speechDownloadProgress.value = jobs.firstOrNull {
+            it.status.isActive && it.type == ProcessingJobType.TRANSCRIBE &&
+                it.message.startsWith("Downloading")
+        }?.progress ?: 0
+        return jobs
+    }
+
+    private suspend fun enqueueJob(noteId: String, type: ProcessingJobType) {
+        store.enqueueProcessingJob(noteId, type)
+            .onSuccess {
+                refreshProcessingJobs()
+                ProcessingWorkScheduler.kick(getApplication())
+            }
+            .onFailure { error ->
+                _appError.value = "The note was saved, but its processing job could not be queued: ${error.message}"
+            }
+    }
+
+    fun retryProcessingJob(job: ProcessingJob) {
+        viewModelScope.launch { enqueueJob(job.noteId, job.type) }
+    }
+
+    fun cancelProcessingJob(job: ProcessingJob) {
+        viewModelScope.launch {
+            val current = store.getProcessingJob(job.id).getOrNull() ?: return@launch
+            store.putProcessingJob(
+                current.copy(
+                    status = ProcessingJobStatus.CANCELLED,
+                    message = "Cancelled",
+                    updatedTimestamp = System.currentTimeMillis() / 1000.0
+                )
+            )
+            if (job.type == ProcessingJobType.TRANSCRIBE) {
+                store.getNote(job.noteId).getOrNull()?.let { note ->
+                    store.putNote(note.copy(transcriptionStatus = TranscriptionStatus.FAILED))
+                }
+            }
+            refreshProcessingJobs()
+            loadData()
+        }
+    }
+
+    fun clearFinishedProcessingJobs() {
+        viewModelScope.launch {
+            store.removeFinishedProcessingJobs()
+            refreshProcessingJobs()
+        }
     }
 
     fun togglePlayback(note: NoteDocument) {
@@ -449,9 +460,11 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
         super.onCleared()
         store.close()
         embedder.close()
-        llm.release()
-        speech.release()
         voiceRecorder.abort()
         stopPlayback()
+    }
+
+    companion object {
+        private const val PROCESSING_POLL_MS = 750L
     }
 }

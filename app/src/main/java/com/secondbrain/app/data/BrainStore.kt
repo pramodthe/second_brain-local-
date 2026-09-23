@@ -323,6 +323,175 @@ class BrainStore(private val context: Context) {
         }
     }
 
+    suspend fun getNote(noteId: String): Result<NoteDocument?> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            val rows = d.run(
+                """
+                ?[id, title, content, at, source] := *note{id, title, content, at, source}, id == "${esc(noteId)}"
+                :limit 1
+                """.trimIndent()
+            )
+            val row = rows.firstOrNull() ?: return@runCatching null
+            val id = row.rows[0].asString()
+            val createdAt = row.rows[3].asDouble()
+            val audio = loadAudioMetadata(d)[id]
+            NoteDocument(
+                id = id,
+                title = row.rows[1].asString(),
+                content = row.rows[2].asString(),
+                timestamp = createdAt,
+                source = row.rows[4].asString(),
+                modifiedTimestamp = loadModifiedTimes(d)[id] ?: createdAt,
+                audioPath = audio?.path,
+                audioDurationMs = audio?.durationMs,
+                transcriptionStatus = audio?.status ?: TranscriptionStatus.NONE
+            )
+        }
+    }
+
+    suspend fun enqueueProcessingJob(
+        noteId: String,
+        type: ProcessingJobType
+    ): Result<ProcessingJob> = withContext(Dispatchers.IO) {
+        runCatching {
+            val existing = getProcessingJob(ProcessingJob.stableId(noteId, type)).getOrThrow()
+            val now = now()
+            if (existing?.status == ProcessingJobStatus.QUEUED) return@runCatching existing
+            if (existing?.status == ProcessingJobStatus.RUNNING) {
+                val superseding = existing.copy(
+                    status = ProcessingJobStatus.QUEUED,
+                    progress = 0,
+                    message = "Waiting for the latest note changes",
+                    error = "",
+                    updatedTimestamp = now
+                )
+                putProcessingJob(superseding).getOrThrow()
+                return@runCatching superseding
+            }
+            val job = ProcessingJob(
+                id = ProcessingJob.stableId(noteId, type),
+                noteId = noteId,
+                type = type,
+                status = ProcessingJobStatus.QUEUED,
+                message = "Waiting to ${type.label.lowercase()}",
+                attempt = existing?.attempt ?: 0,
+                createdTimestamp = now,
+                updatedTimestamp = now
+            )
+            putProcessingJob(job).getOrThrow()
+            job
+        }
+    }
+
+    suspend fun putProcessingJob(job: ProcessingJob): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            d.run(
+                """
+                ?[id, note_id, type, status, progress, message, error, attempt, created_at, updated_at] <- [[
+                    "${esc(job.id)}", "${esc(job.noteId)}", "${job.type.name}", "${job.status.name}",
+                    ${job.progress.coerceIn(0, 100)}, "${esc(job.message)}", "${esc(job.error)}",
+                    ${job.attempt}, ${job.createdTimestamp}, ${job.updatedTimestamp}
+                ]]
+                :put processing_job {id => note_id, type, status, progress, message, error, attempt, created_at, updated_at}
+                """.trimIndent()
+            )
+            Unit
+        }
+    }
+
+    suspend fun getProcessingJob(jobId: String): Result<ProcessingJob?> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            d.run(
+                """
+                ?[id, note_id, type, status, progress, message, error, attempt, created_at, updated_at] :=
+                    *processing_job{id, note_id, type, status, progress, message, error, attempt, created_at, updated_at},
+                    id == "${esc(jobId)}"
+                :limit 1
+                """.trimIndent()
+            ).firstOrNull()?.let(::processingJobFromRow)
+        }
+    }
+
+    suspend fun getProcessingJobs(limit: Int = 100): Result<List<ProcessingJob>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            d.run(
+                """
+                ?[id, note_id, type, status, progress, message, error, attempt, created_at, updated_at] :=
+                    *processing_job{id, note_id, type, status, progress, message, error, attempt, created_at, updated_at}
+                :order -updated_at
+                :limit ${limit.coerceIn(1, 500)}
+                """.trimIndent()
+            ).map(::processingJobFromRow)
+        }
+    }
+
+    suspend fun getNextQueuedProcessingJob(): Result<ProcessingJob?> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            d.run(
+                """
+                ?[id, note_id, type, status, progress, message, error, attempt, created_at, updated_at] :=
+                    *processing_job{id, note_id, type, status, progress, message, error, attempt, created_at, updated_at},
+                    status == "${ProcessingJobStatus.QUEUED.name}"
+                :order created_at
+                :limit 1
+                """.trimIndent()
+            ).firstOrNull()?.let(::processingJobFromRow)
+        }
+    }
+
+    suspend fun recoverInterruptedProcessingJobs(): Result<Int> = withContext(Dispatchers.IO) {
+        runCatching {
+            val interrupted = getProcessingJobs(500).getOrThrow()
+                .filter { it.status == ProcessingJobStatus.RUNNING }
+            interrupted.forEach { job ->
+                putProcessingJob(
+                    job.copy(
+                        status = ProcessingJobStatus.QUEUED,
+                        progress = 0,
+                        message = "Resuming after interruption",
+                        updatedTimestamp = now()
+                    )
+                ).getOrThrow()
+            }
+            interrupted.size
+        }
+    }
+
+    suspend fun removeFinishedProcessingJobs(): Result<Int> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            val finished = getProcessingJobs(500).getOrThrow()
+                .filter { !it.status.isActive }
+            finished.forEach { job ->
+                d.run(
+                    """
+                    ?[id] <- [["${esc(job.id)}"]]
+                    :rm processing_job {id}
+                    """.trimIndent()
+                )
+            }
+            finished.size
+        }
+    }
+
+    private fun processingJobFromRow(row: CozoDb.RelationRow): ProcessingJob = ProcessingJob(
+        id = row.rows[0].asString(),
+        noteId = row.rows[1].asString(),
+        type = ProcessingJobType.fromString(row.rows[2].asString()),
+        status = ProcessingJobStatus.fromString(row.rows[3].asString()),
+        progress = row.rows[4].asInteger(),
+        message = row.rows[5].asString(),
+        error = row.rows[6].asString(),
+        attempt = row.rows[7].asInteger(),
+        createdTimestamp = row.rows[8].asDouble(),
+        updatedTimestamp = row.rows[9].asDouble()
+    )
+
     private fun loadModifiedTimes(d: CozoDb): Map<String, Double> =
         runCatching {
             d.run("?[note_id, modified_at] := *note_meta{note_id, modified_at}")
@@ -362,6 +531,7 @@ class BrainStore(private val context: Context) {
             ":create note {id: String => title: String, content: String, at: Float, source: String}",
             ":create note_meta {note_id: String => modified_at: Float}",
             ":create note_audio {note_id: String => path: String, duration_ms: Int, status: String}",
+            ":create processing_job {id: String => note_id: String, type: String, status: String, progress: Int, message: String, error: String, attempt: Int, created_at: Float, updated_at: Float}",
             ":create entity {name: String => category: String, description: String, at: Float}",
             ":create edge {source: String, relation: String, target: String => at: Float}",
             ":create note_entity {note_id: String, entity_name: String => at: Float}",

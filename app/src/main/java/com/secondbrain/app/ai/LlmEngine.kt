@@ -21,6 +21,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -41,6 +43,7 @@ data class ModelInfo(
 
 class LlmEngine(private val context: Context) {
 
+    private val operationMutex = Mutex()
     private var llm: LlmWrapper? = null
     private var sdkInitialized = false
 
@@ -84,35 +87,37 @@ class LlmEngine(private val context: Context) {
     }
 
     suspend fun loadModel(useGpu: Boolean = true): Result<Unit> = withContext(Dispatchers.IO) {
-        runCatching {
-            if (llm != null) return@runCatching Unit
-            if (!isModelReady()) error("Model file not found at ${modelFile.absolutePath}")
+        operationMutex.withLock {
+            runCatching {
+                if (llm != null) return@runCatching Unit
+                if (!isModelReady()) error("Model file not found at ${modelFile.absolutePath}")
 
-            check(ensureSdkInit()) { "Failed to initialize Nexa SDK" }
+                check(ensureSdkInit()) { "Failed to initialize Nexa SDK" }
 
-            val dev = if (useGpu) DeviceIdValue.GPU else DeviceIdValue.CPU
-            val input = LlmCreateInput(
-                "",
-                modelFile.absolutePath,
-                null,
-                ModelConfig(
-                    nCtx = 4_096,
-                    nGpuLayers = if (useGpu) 999 else 0,
-                    enable_thinking = false,
-                    verbose = true
-                ),
-                PluginIdValue.CPU_GPU.value,
-                dev.value
-            )
+                val dev = if (useGpu) DeviceIdValue.GPU else DeviceIdValue.CPU
+                val input = LlmCreateInput(
+                    "",
+                    modelFile.absolutePath,
+                    null,
+                    ModelConfig(
+                        nCtx = 4_096,
+                        nGpuLayers = if (useGpu) 999 else 0,
+                        enable_thinking = false,
+                        verbose = true
+                    ),
+                    PluginIdValue.CPU_GPU.value,
+                    dev.value
+                )
 
-            val instance = LlmWrapper.builder()
-                .llmCreateInput(input)
-                .build()
-                .getOrThrow()
+                val instance = LlmWrapper.builder()
+                    .llmCreateInput(input)
+                    .build()
+                    .getOrThrow()
 
-            llm = instance
-            Log.i(TAG, "${defaultModel.name} loaded on ${dev.name}")
-            Unit
+                llm = instance
+                Log.i(TAG, "${defaultModel.name} loaded on ${dev.name}")
+                Unit
+            }
         }
     }
 
@@ -175,12 +180,13 @@ class LlmEngine(private val context: Context) {
      * Extracts ontology entities and relations from text using LLM or rule-based fallback.
      */
     suspend fun extractOntology(text: String): ExtractedKnowledge = withContext(Dispatchers.IO) {
-        val engine = llm
-        if (engine == null) {
-            return@withContext ruleBasedExtraction(text)
-        }
+        operationMutex.withLock {
+            val engine = llm
+            if (engine == null) {
+                return@withLock ruleBasedExtraction(text)
+            }
 
-        val prompt = """
+            val prompt = """
             You are a Knowledge Graph extractor. Read the following text and extract key entities and relationships according to this schema:
             Entity categories: Concept, Project, Resource, Person, Decision, Insight
             Relation types: DEPENDS_ON, CONTRADICTS, EXTENDS, MENTIONS, SUPERSEDES, DERIVED_FROM, USES_CONCEPT, AUTHORED_BY, RELATED_TO
@@ -195,8 +201,9 @@ class LlmEngine(private val context: Context) {
             $text
         """.trimIndent()
 
-        val raw = generateSingleTurn(prompt).getOrDefault("")
-        parseExtractionJson(raw).ifEmptyFallback { ruleBasedExtraction(text) }
+            val raw = generateSingleTurn(prompt).getOrDefault("")
+            parseExtractionJson(raw).ifEmptyFallback { ruleBasedExtraction(text) }
+        }
     }
 
     private suspend fun generateSingleTurn(prompt: String): Result<String> = withContext(Dispatchers.IO) {
@@ -210,7 +217,7 @@ class LlmEngine(private val context: Context) {
             val sb = StringBuilder()
             engine.generateStreamFlow(
                 template.formattedText,
-                GenerationConfig(maxTokens = 1024)
+                GenerationConfig(maxTokens = 384)
             ).collect { res ->
                 when (res) {
                     is LlmStreamResult.Token -> sb.append(res.text)
@@ -227,44 +234,46 @@ class LlmEngine(private val context: Context) {
      * Answers user queries grounded in retrieved subgraph context.
      */
     fun answerWithContext(query: String, context: SubgraphContext): Flow<String> = flow {
-        val engine = llm
-        if (engine == null) {
-            emit("*(On-Device LLM is not loaded yet)*\n\n**Retrieved Graph Context:**\n")
-            context.anchorEntities.forEach { emit("• **${it.name}** (${it.category.name}): ${it.description}\n") }
-            context.connectedEdges.forEach { emit("  └─ [${it.relation.name}] → ${it.target}\n") }
-            if (context.relatedNotes.isNotEmpty()) {
-                emit("\n**Related Notes:**\n")
-                context.relatedNotes.forEach { emit("• ${it.title}: ${it.content.take(150)}...\n") }
+        operationMutex.withLock {
+            val engine = llm
+            if (engine == null) {
+                emit("*(On-Device LLM is not loaded yet)*\n\n**Retrieved Graph Context:**\n")
+                context.anchorEntities.forEach { emit("• **${it.name}** (${it.category.name}): ${it.description}\n") }
+                context.connectedEdges.forEach { emit("  └─ [${it.relation.name}] → ${it.target}\n") }
+                if (context.relatedNotes.isNotEmpty()) {
+                    emit("\n**Related Notes:**\n")
+                    context.relatedNotes.forEach { emit("• ${it.title}: ${it.content.take(150)}...\n") }
+                }
+                return@withLock
             }
-            return@flow
-        }
 
-        val contextStr = buildString {
-            appendLine("=== KNOWLEDGE GRAPH ENTITIES ===")
-            context.anchorEntities.forEach { appendLine("- ${it.name} [${it.category.name}]: ${it.description}") }
-            appendLine("\n=== GRAPH RELATIONS ===")
-            context.connectedEdges.forEach { appendLine("- (${it.source}) -[${it.relation.name}]-> (${it.target})") }
-            appendLine("\n=== RELEVANT NOTES ===")
-            context.relatedNotes.forEach { appendLine("Note '${it.title}': ${it.content}") }
-        }
-
-        val msgs = arrayOf(
-            ChatMessage("system", "You are the user's personal Second Brain. Answer questions accurately based strictly on the provided Knowledge Graph context and notes. Cite connected entities and relations when relevant."),
-            ChatMessage("user", "Context:\n$contextStr\n\nQuestion: $query")
-        )
-
-        val template = engine.applyChatTemplate(msgs, null, false).getOrThrow()
-        engine.generateStreamFlow(
-            template.formattedText,
-            GenerationConfig(maxTokens = 1024)
-        ).collect { res ->
-            when (res) {
-                is LlmStreamResult.Token -> emit(res.text)
-                is LlmStreamResult.Error -> emit("\n[Error: ${res.throwable.message}]")
-                is LlmStreamResult.Completed -> Unit
+            val contextStr = buildString {
+                appendLine("=== KNOWLEDGE GRAPH ENTITIES ===")
+                context.anchorEntities.forEach { appendLine("- ${it.name} [${it.category.name}]: ${it.description}") }
+                appendLine("\n=== GRAPH RELATIONS ===")
+                context.connectedEdges.forEach { appendLine("- (${it.source}) -[${it.relation.name}]-> (${it.target})") }
+                appendLine("\n=== RELEVANT NOTES ===")
+                context.relatedNotes.forEach { appendLine("Note '${it.title}': ${it.content}") }
             }
+
+            val msgs = arrayOf(
+                ChatMessage("system", "You are the user's personal Second Brain. Answer questions accurately based strictly on the provided Knowledge Graph context and notes. Cite connected entities and relations when relevant."),
+                ChatMessage("user", "Context:\n$contextStr\n\nQuestion: $query")
+            )
+
+            val template = engine.applyChatTemplate(msgs, null, false).getOrThrow()
+            engine.generateStreamFlow(
+                template.formattedText,
+                GenerationConfig(maxTokens = 1024)
+            ).collect { res ->
+                when (res) {
+                    is LlmStreamResult.Token -> emit(res.text)
+                    is LlmStreamResult.Error -> emit("\n[Error: ${res.throwable.message}]")
+                    is LlmStreamResult.Completed -> Unit
+                }
+            }
+            engine.reset()
         }
-        engine.reset()
     }.flowOn(Dispatchers.IO)
 
     private fun parseExtractionJson(raw: String): ExtractedKnowledge {

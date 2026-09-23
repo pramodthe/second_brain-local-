@@ -39,6 +39,9 @@ import androidx.compose.ui.unit.sp
 import com.secondbrain.app.data.EntityCategory
 import com.secondbrain.app.data.EntityNode
 import com.secondbrain.app.data.NoteDocument
+import com.secondbrain.app.data.ProcessingJob
+import com.secondbrain.app.data.ProcessingJobStatus
+import com.secondbrain.app.data.ProcessingJobType
 import com.secondbrain.app.data.RelationEdge
 import com.secondbrain.app.data.TranscriptionStatus
 import androidx.core.content.ContextCompat
@@ -48,6 +51,7 @@ import java.util.Date
 enum class BrainTab(val label: String) {
     NOTES("Notes"),
     EXPLORE("Explore"),
+    PROCESSING("Tasks"),
     ASK("Ask")
 }
 
@@ -77,6 +81,7 @@ fun BrainApp(viewModel: BrainViewModel) {
                             text = when (selectedTab) {
                                 BrainTab.NOTES -> "Second Brain"
                                 BrainTab.EXPLORE -> "Explore connections"
+                                BrainTab.PROCESSING -> "Processing"
                                 BrainTab.ASK -> "Ask your notes"
                             },
                             fontWeight = FontWeight.SemiBold
@@ -85,6 +90,7 @@ fun BrainApp(viewModel: BrainViewModel) {
                             text = when (selectedTab) {
                                 BrainTab.NOTES -> "Your private knowledge library"
                                 BrainTab.EXPLORE -> "See how your ideas connect"
+                                BrainTab.PROCESSING -> "Reliable on-device background work"
                                 BrainTab.ASK -> "Answers grounded in your knowledge"
                             },
                             style = MaterialTheme.typography.labelMedium,
@@ -108,6 +114,7 @@ fun BrainApp(viewModel: BrainViewModel) {
                                 imageVector = when (tab) {
                                     BrainTab.NOTES -> Icons.Default.Description
                                     BrainTab.EXPLORE -> Icons.Default.Hub
+                                    BrainTab.PROCESSING -> Icons.Default.PendingActions
                                     BrainTab.ASK -> Icons.Default.AutoAwesome
                                 },
                                 contentDescription = tab.label
@@ -149,6 +156,7 @@ fun BrainApp(viewModel: BrainViewModel) {
                     }
                 )
                 BrainTab.EXPLORE -> GraphScreen(viewModel)
+                BrainTab.PROCESSING -> ProcessingScreen(viewModel)
                 BrainTab.ASK -> ChatScreen(viewModel)
             }
         }
@@ -631,6 +639,174 @@ private fun NoteComposerSheet(
                     Icon(Icons.Default.Add, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
                     Text(if (existingNote == null) "Save note" else "Save changes")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ProcessingScreen(viewModel: BrainViewModel) {
+    val jobs by viewModel.processingJobs.collectAsState()
+    val notes by viewModel.notes.collectAsState()
+    val notesById = remember(notes) { notes.associateBy { it.id } }
+    val activeCount = jobs.count { it.status.isActive }
+    val failedCount = jobs.count { it.status == ProcessingJobStatus.FAILED }
+    val completedCount = jobs.count { it.status == ProcessingJobStatus.COMPLETED }
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 104.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                LibraryStat("Active", activeCount, Icons.Default.Sync, Modifier.weight(1f))
+                LibraryStat("Done", completedCount, Icons.Default.CheckCircle, Modifier.weight(1f))
+                LibraryStat("Failed", failedCount, Icons.Default.ErrorOutline, Modifier.weight(1f))
+            }
+        }
+
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Background tasks", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Safe to close the app — unfinished work resumes automatically.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                if (jobs.any { !it.status.isActive }) {
+                    TextButton(onClick = viewModel::clearFinishedProcessingJobs) { Text("Clear") }
+                }
+            }
+        }
+
+        if (jobs.isEmpty()) {
+            item {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 64.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Surface(
+                        modifier = Modifier.size(72.dp),
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.secondaryContainer
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(Icons.Default.DoneAll, null, Modifier.size(32.dp))
+                        }
+                    }
+                    Spacer(Modifier.height(16.dp))
+                    Text("Everything is processed", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "New notes and recordings will appear here.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        } else {
+            items(jobs, key = { it.id }) { job ->
+                ProcessingJobCard(
+                    job = job,
+                    note = notesById[job.noteId],
+                    onRetry = { viewModel.retryProcessingJob(job) },
+                    onCancel = { viewModel.cancelProcessingJob(job) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProcessingJobCard(
+    job: ProcessingJob,
+    note: NoteDocument?,
+    onRetry: () -> Unit,
+    onCancel: () -> Unit
+) {
+    val statusColor = when (job.status) {
+        ProcessingJobStatus.QUEUED -> MaterialTheme.colorScheme.secondaryContainer
+        ProcessingJobStatus.RUNNING -> MaterialTheme.colorScheme.primaryContainer
+        ProcessingJobStatus.COMPLETED -> MaterialTheme.colorScheme.tertiaryContainer
+        ProcessingJobStatus.FAILED -> MaterialTheme.colorScheme.errorContainer
+        ProcessingJobStatus.CANCELLED -> MaterialTheme.colorScheme.surfaceVariant
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(shape = CircleShape, color = statusColor, modifier = Modifier.size(42.dp)) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            if (job.type == ProcessingJobType.TRANSCRIBE) Icons.Default.GraphicEq else Icons.Default.AutoAwesome,
+                            contentDescription = null,
+                            modifier = Modifier.size(21.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(job.type.label, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        note?.let(::noteDisplayTitle) ?: "Note ${job.noteId.takeLast(8)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Surface(shape = RoundedCornerShape(10.dp), color = statusColor) {
+                    Text(
+                        job.status.name.lowercase().replaceFirstChar { it.uppercase() },
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+            Text(job.message, style = MaterialTheme.typography.bodyMedium)
+            if (job.status.isActive) {
+                Spacer(Modifier.height(9.dp))
+                LinearProgressIndicator(
+                    progress = { job.progress.coerceIn(0, 100) / 100f },
+                    modifier = Modifier.fillMaxWidth().height(6.dp).clip(CircleShape)
+                )
+            }
+            if (job.error.isNotBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    job.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Attempt ${job.attempt} · ${formatNoteDateTime(job.updatedTimestamp)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                when {
+                    job.status.isActive -> TextButton(onClick = onCancel) { Text("Cancel") }
+                    job.status.canRetry -> TextButton(onClick = onRetry) { Text("Retry") }
                 }
             }
         }

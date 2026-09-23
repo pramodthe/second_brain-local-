@@ -8,8 +8,10 @@ import com.secondbrain.app.ai.EmbedderEngine
 import com.secondbrain.app.ai.LlmEngine
 import com.secondbrain.app.ai.SpeechEngine
 import com.secondbrain.app.data.BrainStore
+import com.secondbrain.app.data.ProcessingJobType
 import com.secondbrain.app.domain.HybridRetriever
 import com.secondbrain.app.domain.IngestionPipeline
+import com.secondbrain.app.work.ProcessingWorkScheduler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -26,6 +28,8 @@ class BrainProbeReceiver : BroadcastReceiver() {
             try {
                 if (intent?.getBooleanExtra(EXTRA_SPEECH_ONLY, false) == true) {
                     runSpeechDiagnostic(context.applicationContext)
+                } else if (intent?.getBooleanExtra(EXTRA_QUEUE_ONLY, false) == true) {
+                    runQueueDiagnostic(context.applicationContext)
                 } else {
                     runDiagnostic(context.applicationContext)
                 }
@@ -35,6 +39,24 @@ class BrainProbeReceiver : BroadcastReceiver() {
                 pending.finish()
             }
         }
+    }
+
+    private suspend fun runQueueDiagnostic(context: Context) {
+        Log.i(TAG, "================== START QUEUE PROBE ==================")
+        val store = BrainStore(context)
+        try {
+            store.open().getOrThrow()
+            val note = store.getRecentNotes(100).getOrThrow().firstOrNull { it.source == "probe" }
+                ?: error("Run the standard brain probe once to create a safe diagnostic note")
+            val job = store.enqueueProcessingJob(note.id, ProcessingJobType.ORGANIZE).getOrThrow()
+            ProcessingWorkScheduler.kick(context)
+            Log.i(TAG, "QUEUE PASS: job=${job.id} note=${note.id} status=${job.status}")
+        } catch (error: Throwable) {
+            Log.e(TAG, "QUEUE FAIL: ${error.message}", error)
+        } finally {
+            store.close()
+        }
+        Log.i(TAG, "================== QUEUE PROBE COMPLETE ==================")
     }
 
     private suspend fun runSpeechDiagnostic(context: Context) {
@@ -123,5 +145,6 @@ class BrainProbeReceiver : BroadcastReceiver() {
     companion object {
         private const val TAG = "BrainProbe"
         private const val EXTRA_SPEECH_ONLY = "speech_only"
+        private const val EXTRA_QUEUE_ONLY = "queue_only"
     }
 }
