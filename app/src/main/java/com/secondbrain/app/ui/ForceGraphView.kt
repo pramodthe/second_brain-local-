@@ -1,51 +1,55 @@
 package com.secondbrain.app.ui
 
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.ZoomInMap
-import androidx.compose.material.icons.filled.ZoomOutMap
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.secondbrain.app.data.EntityCategory
 import com.secondbrain.app.data.EntityNode
 import com.secondbrain.app.data.RelationEdge
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlin.math.PI
+import kotlin.math.cos
 import kotlin.math.max
-import kotlin.math.min
+import kotlin.math.sin
 import kotlin.math.sqrt
-import kotlin.random.Random
 
 class SimNode(
     val entity: EntityNode,
-    var x: Float,
-    var y: Float,
-    var vx: Float = 0f,
-    var vy: Float = 0f,
-    var isPinned: Boolean = false,
-    val radius: Float = 22f
-)
+    initialX: Float,
+    initialY: Float,
+    val radius: Float
+) {
+    var x by mutableFloatStateOf(initialX)
+    var y by mutableFloatStateOf(initialY)
+    var vx by mutableFloatStateOf(0f)
+    var vy by mutableFloatStateOf(0f)
+}
 
 class SimEdge(
     val edge: RelationEdge,
@@ -60,291 +64,239 @@ fun ForceGraphView(
     modifier: Modifier = Modifier
 ) {
     val textMeasurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    val nodeRadius = with(density) { 28.dp.toPx() }
+    val minimumTouchRadius = with(density) { 32.dp.toPx() }
+    val labelPaddingX = with(density) { 7.dp.toPx() }
+    val labelPaddingY = with(density) { 4.dp.toPx() }
 
-    // Simulation state
-    var scale by remember { mutableFloatStateOf(1.0f) }
+    var scale by remember { mutableFloatStateOf(0.82f) }
     var panOffset by remember { mutableStateOf(Offset.Zero) }
     var selectedNode by remember { mutableStateOf<SimNode?>(null) }
-    var draggedNode by remember { mutableStateOf<SimNode?>(null) }
     var simulationEnergy by remember { mutableFloatStateOf(100f) }
 
-    // Create simulation graph nodes
-    val simNodes = remember(entities) {
-        val count = entities.size
-        val radius = max(180f, count * 35f)
-        entities.mapIndexed { index, e ->
-            val angle = 2f * Math.PI.toFloat() * index / max(1, count)
-            val dist = radius * (0.6f + Random.nextFloat() * 0.5f)
+    val simNodes = remember(entities, nodeRadius) {
+        val count = entities.size.coerceAtLeast(1)
+        val baseRadius = max(170f, sqrt(count.toFloat()) * 95f)
+        entities.mapIndexed { index, entity ->
+            val angle = (2.0 * PI * index / count).toFloat()
+            val ring = baseRadius * (0.72f + (index % 3) * 0.14f)
             SimNode(
-                entity = e,
-                x = dist * kotlin.math.cos(angle),
-                y = dist * kotlin.math.sin(angle)
+                entity = entity,
+                initialX = ring * cos(angle),
+                initialY = ring * sin(angle),
+                radius = nodeRadius
             )
         }
     }
 
     val simEdges = remember(edges, simNodes) {
-        val nameIndex = simNodes.mapIndexed { idx, n -> n.entity.name.lowercase().trim() to idx }.toMap()
-        edges.mapNotNull { e ->
-            val sIdx = nameIndex[e.source.lowercase().trim()]
-            val tIdx = nameIndex[e.target.lowercase().trim()]
-            if (sIdx != null && tIdx != null) {
-                SimEdge(e, sIdx, tIdx)
-            } else null
+        val nameIndex = simNodes.mapIndexed { index, node -> normalizeGraphName(node.entity.name) to index }.toMap()
+        edges.mapNotNull { edge ->
+            val sourceIndex = nameIndex[normalizeGraphName(edge.source)]
+            val targetIndex = nameIndex[normalizeGraphName(edge.target)]
+            if (sourceIndex != null && targetIndex != null && sourceIndex != targetIndex) {
+                SimEdge(edge, sourceIndex, targetIndex)
+            } else {
+                null
+            }
         }
     }
 
-    // Force simulation physics loop
     LaunchedEffect(simNodes, simEdges) {
         simulationEnergy = 100f
-        while (isActive) {
-            if (simulationEnergy > 0.1f) {
-                stepPhysics(simNodes, simEdges)
-                simulationEnergy *= 0.985f
-            }
-            delay(16) // ~60-120fps physics tick
+        while (isActive && simulationEnergy > 0.15f) {
+            stepPhysics(simNodes, simEdges)
+            simulationEnergy *= 0.975f
+            delay(16)
         }
     }
+
+    val canvasColor = Color(0xFF11131A)
+    val labelColor = Color(0xFFF4F2FA)
+    val subduedLabelColor = Color(0xFFAAA8B3)
 
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFF101018))
+            .background(canvasColor)
     ) {
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(Unit) {
-                    // Zoom & Pan
+                .pointerInput(simNodes) {
                     detectTransformGestures { _, pan, zoom, _ ->
-                        scale = (scale * zoom).coerceIn(0.3f, 4.0f)
+                        scale = (scale * zoom).coerceIn(0.35f, 3.5f)
                         panOffset += pan
                     }
                 }
-                .pointerInput(simNodes, scale, panOffset) {
-                    // Tap selection & Dragging
-                    detectTapGestures(
-                        onTap = { tapPos ->
-                            val center = Offset(size.width / 2f, size.height / 2f)
-                            val worldTap = (tapPos - center - panOffset) / scale
-                            val hit = simNodes.find { node ->
+                .pointerInput(simNodes) {
+                    detectTapGestures { tapPosition ->
+                        val center = Offset(size.width / 2f, size.height / 2f)
+                        val worldTap = (tapPosition - center - panOffset) / scale
+                        val hitRadius = max(nodeRadius * 1.45f, minimumTouchRadius / scale)
+                        selectedNode = simNodes
+                            .asReversed()
+                            .firstOrNull { node ->
                                 val dx = node.x - worldTap.x
                                 val dy = node.y - worldTap.y
-                                sqrt(dx * dx + dy * dy) <= (node.radius * 1.5f)
+                                sqrt(dx * dx + dy * dy) <= hitRadius
                             }
-                            selectedNode = hit
-                        }
-                    )
-                }
-                .pointerInput(simNodes, scale, panOffset) {
-                    detectDragGestures(
-                        onDragStart = { startPos ->
-                            val center = Offset(size.width / 2f, size.height / 2f)
-                            val worldStart = (startPos - center - panOffset) / scale
-                            draggedNode = simNodes.find { node ->
-                                val dx = node.x - worldStart.x
-                                val dy = node.y - worldStart.y
-                                sqrt(dx * dx + dy * dy) <= (node.radius * 2f)
-                            }?.also {
-                                it.isPinned = true
-                                simulationEnergy = 80f
-                            }
-                        },
-                        onDrag = { change, dragAmount ->
-                            change.consume()
-                            draggedNode?.let { node ->
-                                node.x += dragAmount.x / scale
-                                node.y += dragAmount.y / scale
-                                simulationEnergy = max(simulationEnergy, 40f)
-                            }
-                        },
-                        onDragEnd = {
-                            draggedNode?.isPinned = false
-                            draggedNode = null
-                        },
-                        onDragCancel = {
-                            draggedNode?.isPinned = false
-                            draggedNode = null
-                        }
-                    )
+                    }
                 }
         ) {
             val center = Offset(size.width / 2f, size.height / 2f)
 
-            // Screen transform helper
-            fun toScreen(worldX: Float, worldY: Float): Offset {
-                return Offset(
-                    center.x + panOffset.x + worldX * scale,
-                    center.y + panOffset.y + worldY * scale
-                )
-            }
+            fun toScreen(worldX: Float, worldY: Float): Offset = Offset(
+                center.x + panOffset.x + worldX * scale,
+                center.y + panOffset.y + worldY * scale
+            )
 
             val focused = selectedNode
 
-            // 1. Draw Edges
-            for (edge in simEdges) {
+            simEdges.forEach { edge ->
                 val source = simNodes[edge.sourceIndex]
                 val target = simNodes[edge.targetIndex]
-
-                val p1 = toScreen(source.x, source.y)
-                val p2 = toScreen(target.x, target.y)
-
-                val isConnectedToFocus = focused == null || source == focused || target == focused
-                val edgeColor = if (isConnectedToFocus) {
-                    if (focused != null) Color(0xFF00E5FF).copy(alpha = 0.85f)
-                    else Color(0xFF8888AA).copy(alpha = 0.45f)
-                } else {
-                    Color(0xFF444455).copy(alpha = 0.15f)
-                }
-                val strokeWidth = if (focused != null && isConnectedToFocus) 2.5f * scale else 1.2f * scale
+                val sourcePoint = toScreen(source.x, source.y)
+                val targetPoint = toScreen(target.x, target.y)
+                val isConnected = focused == null || source == focused || target == focused
 
                 drawLine(
-                    color = edgeColor,
-                    start = p1,
-                    end = p2,
-                    strokeWidth = strokeWidth.coerceIn(1f, 5f)
+                    color = when {
+                        focused != null && isConnected -> Color(0xFF8BE0D0).copy(alpha = 0.9f)
+                        isConnected -> Color(0xFF8C91A3).copy(alpha = 0.55f)
+                        else -> Color(0xFF4A4D59).copy(alpha = 0.18f)
+                    },
+                    start = sourcePoint,
+                    end = targetPoint,
+                    strokeWidth = if (focused != null && isConnected) 3f else 1.5f
                 )
             }
 
-            // 2. Draw Nodes
-            for (node in simNodes) {
-                val p = toScreen(node.x, node.y)
+            simNodes.forEach { node ->
+                val point = toScreen(node.x, node.y)
                 val isSelected = node == focused
-                val isConnected = focused == null || isSelected || simEdges.any {
-                    (simNodes[it.sourceIndex] == focused && simNodes[it.targetIndex] == node) ||
-                            (simNodes[it.targetIndex] == focused && simNodes[it.sourceIndex] == node)
+                val isConnected = focused == null || isSelected || simEdges.any { edge ->
+                    (simNodes[edge.sourceIndex] == focused && simNodes[edge.targetIndex] == node) ||
+                        (simNodes[edge.targetIndex] == focused && simNodes[edge.sourceIndex] == node)
+                }
+                val radius = (node.radius * scale * if (isSelected) 1.16f else 1f).coerceIn(13f, 62f)
+                val nodeColor = categoryColor(node.entity.category).let {
+                    if (isConnected) it else it.copy(alpha = 0.22f)
                 }
 
-                val baseColor = categoryColor(node.entity.category)
-                val nodeColor = if (isConnected) baseColor else baseColor.copy(alpha = 0.25f)
-                val r = (node.radius * (if (isSelected) 1.35f else 1.0f) * scale).coerceIn(8f, 60f)
-
-                // Outer Glow ring if selected
                 if (isSelected) {
-                    drawCircle(
-                        color = Color.White.copy(alpha = 0.35f),
-                        radius = r + 8f,
-                        center = p
-                    )
-                    drawCircle(
-                        color = Color(0xFF00E5FF).copy(alpha = 0.8f),
-                        radius = r + 4f,
-                        center = p,
-                        style = Stroke(width = 2.5f)
-                    )
+                    drawCircle(Color.White.copy(alpha = 0.12f), radius + 12f, point)
+                    drawCircle(Color(0xFF8BE0D0), radius + 5f, point, style = Stroke(3f))
                 }
+                drawCircle(nodeColor, radius, point)
+                drawCircle(Color.White.copy(alpha = if (isConnected) 0.9f else 0.2f), radius * 0.24f, point)
 
-                // Node Body
-                drawCircle(
-                    color = nodeColor,
-                    radius = r,
-                    center = p
-                )
-
-                // Inner core
-                drawCircle(
-                    color = Color.White.copy(alpha = if (isConnected) 0.85f else 0.2f),
-                    radius = (r * 0.35f),
-                    center = p
-                )
-
-                // Label (only if scale is reasonable or node is focused)
-                if (scale >= 0.7f || isSelected) {
-                    val label = node.entity.name
+                if (scale >= 0.62f || isSelected) {
+                    val label = node.entity.name.take(28)
                     val measured = textMeasurer.measure(
                         text = label,
                         style = TextStyle(
-                            color = if (isConnected) Color.White else Color.Gray.copy(alpha = 0.4f),
-                            fontSize = (11f * scale).coerceIn(9f, 16f).sp,
-                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                            color = if (isConnected) labelColor else subduedLabelColor.copy(alpha = 0.35f),
+                            fontSize = (12f * scale).coerceIn(11f, 15f).sp,
+                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
                         )
+                    )
+                    val labelTopLeft = Offset(
+                        point.x - measured.size.width / 2f - labelPaddingX,
+                        point.y + radius + 7f
+                    )
+                    drawRoundRect(
+                        color = Color(0xE620222B),
+                        topLeft = labelTopLeft,
+                        size = Size(
+                            measured.size.width + labelPaddingX * 2,
+                            measured.size.height + labelPaddingY * 2
+                        ),
+                        cornerRadius = CornerRadius(8f, 8f)
                     )
                     drawText(
                         textLayoutResult = measured,
-                        topLeft = Offset(p.x - measured.size.width / 2f, p.y + r + 4f)
+                        topLeft = Offset(labelTopLeft.x + labelPaddingX, labelTopLeft.y + labelPaddingY)
                     )
                 }
             }
         }
 
-        // Overlay Controls (Zoom In, Zoom Out, Reset Pan)
+        Surface(
+            modifier = Modifier.align(Alignment.TopStart).padding(14.dp),
+            shape = RoundedCornerShape(12.dp),
+            color = Color(0xD91D2029)
+        ) {
+            Text(
+                "Drag to move · pinch to zoom · tap a node",
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                color = Color(0xFFD7D5DE),
+                style = MaterialTheme.typography.labelMedium
+            )
+        }
+
         Column(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(16.dp),
+            modifier = Modifier.align(Alignment.TopEnd).padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            FilledTonalIconButton(
-                onClick = { scale = (scale * 1.25f).coerceAtMost(4.0f) },
-                colors = IconButtonDefaults.filledTonalIconButtonColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.8f)
-                )
-            ) {
-                Icon(Icons.Default.ZoomInMap, contentDescription = "Zoom In")
+            GraphControl(Icons.Default.Add, "Zoom in") {
+                scale = (scale * 1.2f).coerceAtMost(3.5f)
             }
-            FilledTonalIconButton(
-                onClick = { scale = (scale * 0.8f).coerceAtLeast(0.3f) },
-                colors = IconButtonDefaults.filledTonalIconButtonColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.8f)
-                )
-            ) {
-                Icon(Icons.Default.ZoomOutMap, contentDescription = "Zoom Out")
+            GraphControl(Icons.Default.Remove, "Zoom out") {
+                scale = (scale / 1.2f).coerceAtLeast(0.35f)
+            }
+            GraphControl(Icons.Default.CenterFocusStrong, "Fit graph") {
+                scale = 0.82f
+                panOffset = Offset.Zero
+                selectedNode = null
             }
         }
 
-        // Selected Node Inspection Card (Obsidian-style detail card)
         selectedNode?.let { node ->
+            val connected = simEdges.filter {
+                simNodes[it.sourceIndex] == node || simNodes[it.targetIndex] == node
+            }
             Card(
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)),
-                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .align(Alignment.BottomCenter)
-                    .padding(16.dp)
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 10.dp),
+                modifier = Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(14.dp)
             ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Surface(
-                                shape = RoundedCornerShape(6.dp),
-                                color = categoryColor(node.entity.category)
-                            ) {
-                                Text(
-                                    " ${node.entity.category.label} ",
-                                    color = Color.Black,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 11.sp
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(node.entity.name, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                        }
-                        IconButton(onClick = { selectedNode = null }, modifier = Modifier.size(24.dp)) {
-                            Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.Gray)
-                        }
-                    }
-
-                    val connected = simEdges.filter {
-                        simNodes[it.sourceIndex] == node || simNodes[it.targetIndex] == node
-                    }
-                    if (connected.isNotEmpty()) {
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text("Connected Knowledge (${connected.size} links):", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                        connected.take(4).forEach { e ->
-                            val isSource = simNodes[e.sourceIndex] == node
-                            val neighbor = if (isSource) simNodes[e.targetIndex] else simNodes[e.sourceIndex]
-                            val rel = e.edge.relation.name
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            Modifier
+                                .size(12.dp)
+                                .background(categoryColor(node.entity.category), CircleShape)
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(node.entity.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                             Text(
-                                " • ${if (isSource) "[$rel] →" else "← [$rel]"} ${neighbor.entity.name}",
-                                fontSize = 12.sp,
+                                "${node.entity.category.label} · ${connected.size} ${if (connected.size == 1) "connection" else "connections"}",
+                                style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
+                        IconButton(onClick = { selectedNode = null }) {
+                            Icon(Icons.Default.Close, contentDescription = "Close details")
+                        }
+                    }
+                    if (node.entity.description.isNotBlank()) {
+                        Spacer(Modifier.height(10.dp))
+                        Text(node.entity.description, style = MaterialTheme.typography.bodyMedium)
+                    }
+                    connected.take(4).forEach { connection ->
+                        val outgoing = simNodes[connection.sourceIndex] == node
+                        val neighbor = if (outgoing) simNodes[connection.targetIndex] else simNodes[connection.sourceIndex]
+                        Text(
+                            if (outgoing) "${connection.edge.relation.name.replace('_', ' ').lowercase()} → ${neighbor.entity.name}"
+                            else "${neighbor.entity.name} → ${connection.edge.relation.name.replace('_', ' ').lowercase()}",
+                            modifier = Modifier.padding(top = 7.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
             }
@@ -352,64 +304,71 @@ fun ForceGraphView(
     }
 }
 
-/**
- * 2D Force-Directed Simulation Step (Coulomb repulsion + Hooke spring attraction + gravity).
- */
+@Composable
+private fun GraphControl(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    description: String,
+    onClick: () -> Unit
+) {
+    FilledTonalIconButton(
+        onClick = onClick,
+        colors = IconButtonDefaults.filledTonalIconButtonColors(
+            containerColor = Color(0xE62A2D37),
+            contentColor = Color.White
+        )
+    ) {
+        Icon(icon, contentDescription = description)
+    }
+}
+
 private fun stepPhysics(nodes: List<SimNode>, edges: List<SimEdge>) {
-    val kRepulsion = 1400f
-    val kSpring = 0.045f
-    val restLength = 110f
-    val kGravity = 0.025f
-    val damping = 0.86f
+    val repulsion = 90_000f
+    val spring = 0.009f
+    val restLength = 220f
+    val gravity = 0.0035f
+    val damping = 0.82f
 
-    // 1. Repulsion between all node pairs
     for (i in nodes.indices) {
-        val n1 = nodes[i]
+        val first = nodes[i]
         for (j in i + 1 until nodes.size) {
-            val n2 = nodes[j]
-            var dx = n2.x - n1.x
-            var dy = n2.y - n1.y
-            var dist = sqrt(dx * dx + dy * dy)
-            if (dist < 1f) {
-                dx = Random.nextFloat() - 0.5f
-                dy = Random.nextFloat() - 0.5f
-                dist = 1f
+            val second = nodes[j]
+            var dx = second.x - first.x
+            var dy = second.y - first.y
+            var distance = sqrt(dx * dx + dy * dy)
+            if (distance < 1f) {
+                dx = 0.5f
+                dy = 0.5f
+                distance = 1f
             }
-            val force = kRepulsion / (dist * dist)
-            val fx = (dx / dist) * force
-            val fy = (dy / dist) * force
-
-            if (!n1.isPinned) { n1.vx -= fx; n1.vy -= fy }
-            if (!n2.isPinned) { n2.vx += fx; n2.vy += fy }
+            val force = repulsion / (distance * distance)
+            val forceX = (dx / distance) * force
+            val forceY = (dy / distance) * force
+            first.vx -= forceX
+            first.vy -= forceY
+            second.vx += forceX
+            second.vy += forceY
         }
     }
 
-    // 2. Spring attraction along edges
-    for (e in edges) {
-        val n1 = nodes[e.sourceIndex]
-        val n2 = nodes[e.targetIndex]
-        var dx = n2.x - n1.x
-        var dy = n2.y - n1.y
-        var dist = sqrt(dx * dx + dy * dy)
-        if (dist < 1f) dist = 1f
-        val delta = dist - restLength
-        val force = kSpring * delta
-        val fx = (dx / dist) * force
-        val fy = (dy / dist) * force
-
-        if (!n1.isPinned) { n1.vx += fx; n1.vy += fy }
-        if (!n2.isPinned) { n2.vx -= fx; n2.vy -= fy }
+    edges.forEach { edge ->
+        val source = nodes[edge.sourceIndex]
+        val target = nodes[edge.targetIndex]
+        val dx = target.x - source.x
+        val dy = target.y - source.y
+        val distance = sqrt(dx * dx + dy * dy).coerceAtLeast(1f)
+        val force = spring * (distance - restLength)
+        val forceX = (dx / distance) * force
+        val forceY = (dy / distance) * force
+        source.vx += forceX
+        source.vy += forceY
+        target.vx -= forceX
+        target.vy -= forceY
     }
 
-    // 3. Center gravity and position update
-    for (node in nodes) {
-        if (!node.isPinned) {
-            node.vx -= node.x * kGravity
-            node.vy -= node.y * kGravity
-            node.vx *= damping
-            node.vy *= damping
-            node.x += node.vx
-            node.y += node.vy
-        }
+    nodes.forEach { node ->
+        node.vx = (node.vx - node.x * gravity) * damping
+        node.vy = (node.vy - node.y * gravity) * damping
+        node.x += node.vx
+        node.y += node.vy
     }
 }

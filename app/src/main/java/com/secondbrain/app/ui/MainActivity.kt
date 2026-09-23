@@ -27,17 +27,29 @@ class MainActivity : ComponentActivity() {
             val isDark = isSystemInDarkTheme()
             val colors = if (isDark) {
                 darkColorScheme(
-                    primary = Color(0xFFB388FF),
-                    secondary = Color(0xFF00E5FF),
-                    surface = Color(0xFF1E1E2E),
-                    surfaceVariant = Color(0xFF282A36)
+                    primary = Color(0xFFBEC5FF),
+                    onPrimary = Color(0xFF24306B),
+                    primaryContainer = Color(0xFF3B477F),
+                    onPrimaryContainer = Color(0xFFDDE1FF),
+                    secondary = Color(0xFF82D5C6),
+                    secondaryContainer = Color(0xFF174F48),
+                    background = Color(0xFF111318),
+                    surface = Color(0xFF111318),
+                    surfaceVariant = Color(0xFF45464F),
+                    outline = Color(0xFF90909A)
                 )
             } else {
                 lightColorScheme(
-                    primary = Color(0xFF6200EE),
-                    secondary = Color(0xFF03DAC6),
-                    surface = Color(0xFFFFFFFF),
-                    surfaceVariant = Color(0xFFF5F5F7)
+                    primary = Color(0xFF4C5DAA),
+                    onPrimary = Color.White,
+                    primaryContainer = Color(0xFFDDE1FF),
+                    onPrimaryContainer = Color(0xFF06164B),
+                    secondary = Color(0xFF356A62),
+                    secondaryContainer = Color(0xFFB8F0E5),
+                    background = Color(0xFFFBF8FF),
+                    surface = Color(0xFFFBF8FF),
+                    surfaceVariant = Color(0xFFE4E1EC),
+                    outline = Color(0xFF767680)
                 )
             }
 
