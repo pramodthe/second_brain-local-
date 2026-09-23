@@ -2,11 +2,12 @@
 
 An offline-first Android knowledge workspace that turns notes and shared text into a local knowledge graph. It combines vector similarity with graph traversal so answers can use both semantic relevance and explicit relationships.
 
-> This is an early-stage project. The bundled diagnostic probe is intended for development verification; do not expose it in production builds without an appropriate permission or access control.
+> This is an early-stage project. The diagnostic probe is registered only in debug builds and is not exported by release builds.
 
 ## Highlights
 
 - Capture notes in the app or share plain text from another Android app.
+- Record voice notes, preserve the original audio, play it back, and transcribe it fully offline.
 - Save raw notes immediately, edit them later, and retain created/modified timestamps.
 - Store notes, entities, and relationships locally in CozoDB.
 - Retrieve relevant notes with HNSW vector search, then expand related graph context.
@@ -17,22 +18,22 @@ An offline-first Android knowledge workspace that turns notes and shared text in
 ## Architecture
 
 ```text
-Capture / Android share sheet
-           |
-           v
-Ingestion pipeline ----> embeddings ----> CozoDB HNSW index
-           |                                  |
-           +----> entities and relations ----> knowledge graph
-                                                  |
+Text / share sheet ---------> durable note --------> embeddings ----> CozoDB HNSW index
+                                  ^                       |
+Voice ----> durable WAV ----> offline transcript          +----> entities + relationships
+                                                                         |
+                                                                         v
+                                                                  knowledge graph
+                                                                         |
 Question -> query embedding -> similar notes -> graph expansion -> local LLM answer
 ```
 
-Note capture is intentionally split into two steps. The original text is written to local storage first; embeddings and ontology extraction then run in the background. A slow or unavailable model therefore cannot prevent a note from being saved.
+Capture is intentionally durable-first. Original text or audio is written to private local storage before transcription, embeddings, or ontology extraction runs in the background. A slow, unavailable, or interrupted model therefore cannot prevent a memory from being saved.
 
 ## Product roadmap
 
-- **Phase 1 — Capture foundation:** instant text capture, optional titles, editing, timestamps, and background organization.
-- **Phase 2 — Voice capture:** durable recordings, playback, and offline transcription.
+- **Phase 1 — Capture foundation (complete):** instant text capture, optional titles, editing, timestamps, and background organization.
+- **Phase 2 — Voice capture (complete):** durable recordings, playback, offline transcription, visible processing state, and retry.
 - **Phase 3 — Processing queue:** persistent, resumable AI jobs with visible status and retries.
 - **Phase 4 — Knowledge quality:** aliases, duplicate resolution, evidence, confidence, and review workflows.
 - **Phase 5 — Retrieval:** stronger search, related notes, timelines, and source-grounded answers.
@@ -45,6 +46,7 @@ Note capture is intentionally split into two steps. The original text is written
 - An Android 9 (API 28) or newer `arm64-v8a` device or emulator.
 - A high-memory Android device for the default 9B model; the tested device has 16 GB RAM.
 - A connected device and Android Platform Tools for installation and probe commands.
+- Microphone permission when recording a voice note.
 
 The app is packaged only for `arm64-v8a`, because its on-device dependencies include native libraries.
 
@@ -65,11 +67,19 @@ If Android Studio cannot find your SDK, create `local.properties` (which is igno
 sdk.dir=/absolute/path/to/Android/sdk
 ```
 
-## On-device model
+## On-device models
+
+### Language and knowledge extraction
 
 The default model is [Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF), using the `Q4_K_M` quantization (5,680,522,464 bytes). The app downloads it into private app storage and runs it through Nexa SDK 0.0.24 with the OpenCL GPU backend. Model files are intentionally excluded from source control.
 
 This is a demanding mobile configuration. On the tested RMX5011/Snapdragon 8 Elite device with 16 GB RAM, the model loaded in roughly 23 seconds and Nexa reported about 10.2 prompt tokens/second and 2.7 generated tokens/second. Performance and memory use vary by device and runtime. Without the model, capture, graph storage, search, and rule-based extraction continue to work; chat presents retrieved graph context instead of generating an LLM response.
+
+### Speech recognition
+
+Voice notes use Nexa SDK 0.0.24's `whisper.cpp` backend with the multilingual Whisper Tiny model (`whisper-tiny.bin`, 77,691,730 bytes). The first transcription downloads the model from [unslothai/whisper-tiny-GGUF](https://huggingface.co/unslothai/whisper-tiny-GGUF); progress is shown in the app and partial downloads can resume. The recording is saved immediately and remains playable if the download or transcription fails.
+
+The engine tries NPU, GPU, and CPU in that order. On the tested RMX5011/Snapdragon 8 Elite, Nexa loaded the model on the NPU and transcribed the synthetic device test correctly. Speech recognition does not upload recordings. Whisper Tiny is the Phase 2 baseline; the `SpeechEngine` boundary keeps a later Qualcomm Voice AI or larger-model upgrade isolated from the capture and note-storage layers.
 
 ## Verify on a device
 
@@ -82,11 +92,21 @@ adb logcat -d -s BrainProbe:V
 
 The probe opens the local database, creates embeddings, ingests sample notes, runs vector search, and performs hybrid retrieval.
 
+To exercise only speech recognition, place a 16 kHz mono PCM WAV at `files/probe/speech-test.wav` in the app's private storage and run:
+
+```bash
+adb shell am broadcast \
+  -a com.secondbrain.app.PROBE \
+  -n com.secondbrain.app/.probe.BrainProbeReceiver \
+  --ez speech_only true
+adb logcat -d -s BrainProbe:V SpeechEngine:V
+```
+
 ## Project layout
 
 ```text
 app/src/main/java/com/secondbrain/app/
-├── ai/       # Local embedding and LLM integrations
+├── ai/       # Local embedding, LLM, recording, and speech integrations
 ├── data/     # CozoDB store and ontology data types
 ├── domain/   # Ingestion and hybrid retrieval workflows
 ├── probe/    # ADB diagnostic receiver
@@ -95,14 +115,14 @@ app/src/main/java/com/secondbrain/app/
 
 ## Privacy and security notes
 
-Knowledge is stored in the app’s private Android storage. The optional model download contacts Hugging Face only to fetch the model file; once installed, inference runs on-device. Review third-party dependency licenses and secure or remove the diagnostic receiver before distributing a production APK.
+Knowledge and original voice recordings are stored in the app’s private Android storage. Optional model downloads contact Hugging Face only to fetch model files; once installed, inference runs on-device. Android backups may include app-private data while `allowBackup` is enabled. Review third-party dependency licenses and secure or remove the diagnostic receiver before distributing a production APK.
 
 ## Contributing
 
 Keep generated APKs, AARs, model files, local SDK settings, and secrets out of commits. Before opening a pull request, run:
 
 ```bash
-./gradlew assembleDebug
+./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
 
 ## License

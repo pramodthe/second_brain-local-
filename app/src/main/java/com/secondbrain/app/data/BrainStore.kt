@@ -13,6 +13,12 @@ import java.io.File
  */
 class BrainStore(private val context: Context) {
 
+    private data class StoredAudio(
+        val path: String,
+        val durationMs: Long,
+        val status: TranscriptionStatus
+    )
+
     private var db: CozoDb? = null
 
     val dbFile: File
@@ -64,6 +70,14 @@ class BrainStore(private val context: Context) {
                 :put note_meta {note_id => modified_at}
                 """.trimIndent()
             )
+            note.audioPath?.let { audioPath ->
+                d.run(
+                    """
+                    ?[note_id, path, duration_ms, status] <- [["${esc(note.id)}", "${esc(audioPath)}", ${note.audioDurationMs ?: 0L}, "${note.transcriptionStatus.name}"]]
+                    :put note_audio {note_id => path, duration_ms, status}
+                    """.trimIndent()
+                )
+            }
 
             // 2. Store Entities
             if (knowledge.entities.isNotEmpty()) {
@@ -137,16 +151,21 @@ class BrainStore(private val context: Context) {
 
             val rows = d.run(query)
             val modifiedTimes = loadModifiedTimes(d)
+            val audioMetadata = loadAudioMetadata(d)
             rows.map { r ->
                 val id = r.rows[0].asString()
                 val createdAt = r.rows[3].asDouble()
+                val audio = audioMetadata[id]
                 val doc = NoteDocument(
                     id = id,
                     title = r.rows[1].asString(),
                     content = r.rows[2].asString(),
                     timestamp = createdAt,
                     source = r.rows[4].asString(),
-                    modifiedTimestamp = modifiedTimes[id] ?: createdAt
+                    modifiedTimestamp = modifiedTimes[id] ?: createdAt,
+                    audioPath = audio?.path,
+                    audioDurationMs = audio?.durationMs,
+                    transcriptionStatus = audio?.status ?: TranscriptionStatus.NONE
                 )
                 val dist = r.rows[5].asFloat()
                 doc to dist
@@ -218,16 +237,21 @@ class BrainStore(private val context: Context) {
                 """.trimIndent()
                 val noteRows = runCatching { d.run(noteQuery) }.getOrDefault(emptyList())
                 val modifiedTimes = loadModifiedTimes(d)
+                val audioMetadata = loadAudioMetadata(d)
                 val notes = noteRows.map { r ->
                     val id = r.rows[0].asString()
                     val createdAt = r.rows[3].asDouble()
+                    val audio = audioMetadata[id]
                     NoteDocument(
                         id = id,
                         title = r.rows[1].asString(),
                         content = r.rows[2].asString(),
                         timestamp = createdAt,
                         source = r.rows[4].asString(),
-                        modifiedTimestamp = modifiedTimes[id] ?: createdAt
+                        modifiedTimestamp = modifiedTimes[id] ?: createdAt,
+                        audioPath = audio?.path,
+                        audioDurationMs = audio?.durationMs,
+                        transcriptionStatus = audio?.status ?: TranscriptionStatus.NONE
                     )
                 }
 
@@ -279,16 +303,21 @@ class BrainStore(private val context: Context) {
             val d = db ?: error("Database not open")
             val rows = d.run("?[id, title, content, at, source] := *note{id, title, content, at, source} :order -at :limit $limit")
             val modifiedTimes = loadModifiedTimes(d)
+            val audioMetadata = loadAudioMetadata(d)
             rows.map { r ->
                 val id = r.rows[0].asString()
                 val createdAt = r.rows[3].asDouble()
+                val audio = audioMetadata[id]
                 NoteDocument(
                     id = id,
                     title = r.rows[1].asString(),
                     content = r.rows[2].asString(),
                     timestamp = createdAt,
                     source = r.rows[4].asString(),
-                    modifiedTimestamp = modifiedTimes[id] ?: createdAt
+                    modifiedTimestamp = modifiedTimes[id] ?: createdAt,
+                    audioPath = audio?.path,
+                    audioDurationMs = audio?.durationMs,
+                    transcriptionStatus = audio?.status ?: TranscriptionStatus.NONE
                 )
             }
         }
@@ -298,6 +327,18 @@ class BrainStore(private val context: Context) {
         runCatching {
             d.run("?[note_id, modified_at] := *note_meta{note_id, modified_at}")
                 .associate { row -> row.rows[0].asString() to row.rows[1].asDouble() }
+        }.getOrDefault(emptyMap())
+
+    private fun loadAudioMetadata(d: CozoDb): Map<String, StoredAudio> =
+        runCatching {
+            d.run("?[note_id, path, duration_ms, status] := *note_audio{note_id, path, duration_ms, status}")
+                .associate { row ->
+                    row.rows[0].asString() to StoredAudio(
+                        path = row.rows[1].asString(),
+                        durationMs = row.rows[2].asInteger().toLong(),
+                        status = TranscriptionStatus.fromString(row.rows[3].asString())
+                    )
+                }
         }.getOrDefault(emptyMap())
 
     suspend fun getStats(): Map<String, Int> = withContext(Dispatchers.IO) {
@@ -320,6 +361,7 @@ class BrainStore(private val context: Context) {
         private val SCHEMA = listOf(
             ":create note {id: String => title: String, content: String, at: Float, source: String}",
             ":create note_meta {note_id: String => modified_at: Float}",
+            ":create note_audio {note_id: String => path: String, duration_ms: Int, status: String}",
             ":create entity {name: String => category: String, description: String, at: Float}",
             ":create edge {source: String, relation: String, target: String => at: Float}",
             ":create note_entity {note_id: String, entity_name: String => at: Float}",

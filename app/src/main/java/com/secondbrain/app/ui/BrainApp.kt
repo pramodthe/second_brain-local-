@@ -1,5 +1,9 @@
 package com.secondbrain.app.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -26,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
@@ -35,6 +40,8 @@ import com.secondbrain.app.data.EntityCategory
 import com.secondbrain.app.data.EntityNode
 import com.secondbrain.app.data.NoteDocument
 import com.secondbrain.app.data.RelationEdge
+import com.secondbrain.app.data.TranscriptionStatus
+import androidx.core.content.ContextCompat
 import java.text.DateFormat
 import java.util.Date
 
@@ -168,6 +175,8 @@ fun NotesScreen(
     val notes by viewModel.notes.collectAsState()
     val stats by viewModel.stats.collectAsState()
     val processingNoteIds by viewModel.processingNoteIds.collectAsState()
+    val speechProcessingNoteIds by viewModel.speechProcessingNoteIds.collectAsState()
+    val playingNoteId by viewModel.playingNoteId.collectAsState()
     var searchQuery by rememberSaveable { mutableStateOf("") }
 
     val visibleNotes = remember(notes, searchQuery) {
@@ -243,7 +252,11 @@ fun NotesScreen(
                 NoteCard(
                     note = note,
                     isProcessing = note.id in processingNoteIds,
-                    onOpen = { onEditNote(note) }
+                    isSpeechProcessing = note.id in speechProcessingNoteIds,
+                    isPlaying = note.id == playingNoteId,
+                    onOpen = { onEditNote(note) },
+                    onTogglePlayback = { viewModel.togglePlayback(note) },
+                    onRetryTranscription = { viewModel.retryTranscription(note) }
                 )
             }
         }
@@ -303,7 +316,15 @@ private fun EmptyNotesState(isSearching: Boolean, onNewNote: () -> Unit) {
 }
 
 @Composable
-fun NoteCard(note: NoteDocument, isProcessing: Boolean, onOpen: () -> Unit) {
+fun NoteCard(
+    note: NoteDocument,
+    isProcessing: Boolean,
+    isSpeechProcessing: Boolean,
+    isPlaying: Boolean,
+    onOpen: () -> Unit,
+    onTogglePlayback: () -> Unit,
+    onRetryTranscription: () -> Unit
+) {
     Card(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen),
         shape = RoundedCornerShape(18.dp),
@@ -339,7 +360,7 @@ fun NoteCard(note: NoteDocument, isProcessing: Boolean, onOpen: () -> Unit) {
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                note.content.trim(),
+                notePreviewText(note),
                 style = MaterialTheme.typography.bodyLarge,
                 maxLines = 3,
                 overflow = TextOverflow.Ellipsis,
@@ -367,6 +388,36 @@ fun NoteCard(note: NoteDocument, isProcessing: Boolean, onOpen: () -> Unit) {
                         }
                     }
                 }
+                if (note.audioPath != null) {
+                    AssistChip(
+                        onClick = onTogglePlayback,
+                        leadingIcon = {
+                            Icon(
+                                if (isPlaying) Icons.Default.Stop else Icons.Default.PlayArrow,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        },
+                        label = { Text(formatDuration(note.audioDurationMs ?: 0L)) }
+                    )
+                }
+            }
+            if (note.audioPath != null && note.transcriptionStatus != TranscriptionStatus.COMPLETE) {
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        transcriptionLabel(note.transcriptionStatus, isSpeechProcessing),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (note.transcriptionStatus == TranscriptionStatus.FAILED && !isSpeechProcessing) {
+                        TextButton(onClick = onRetryTranscription) { Text("Retry") }
+                    }
+                }
             }
         }
     }
@@ -382,10 +433,28 @@ private fun NoteComposerSheet(
     var title by rememberSaveable(existingNote?.id) { mutableStateOf(existingNote?.title.orEmpty()) }
     var content by rememberSaveable(existingNote?.id) { mutableStateOf(existingNote?.content.orEmpty()) }
     val isIngesting by viewModel.isIngesting.collectAsState()
+    val isRecording by viewModel.isRecording.collectAsState()
+    val recordingElapsedMs by viewModel.recordingElapsedMs.collectAsState()
+    val isVoiceCaptureBusy by viewModel.isVoiceCaptureBusy.collectAsState()
+    val speechModelReady by viewModel.speechModelReady.collectAsState()
+    val speechDownloadProgress by viewModel.speechDownloadProgress.collectAsState()
+    val playingNoteId by viewModel.playingNoteId.collectAsState()
+    val context = LocalContext.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val microphonePermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            viewModel.startVoiceRecording()
+        } else {
+            viewModel.reportAppError("Microphone permission is required to record a voice note.")
+        }
+    }
 
     ModalBottomSheet(
-        onDismissRequest = { if (!isIngesting) onDismiss() },
+        onDismissRequest = {
+            if (!isIngesting && !isRecording && !isVoiceCaptureBusy) onDismiss()
+        },
         sheetState = sheetState,
         dragHandle = { BottomSheetDefaults.DragHandle() }
     ) {
@@ -411,6 +480,117 @@ private fun NoteComposerSheet(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(20.dp))
+            if (existingNote == null) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    color = if (isRecording) {
+                        MaterialTheme.colorScheme.errorContainer
+                    } else {
+                        MaterialTheme.colorScheme.surfaceContainer
+                    }
+                ) {
+                    Column(Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                if (isRecording) Icons.Default.GraphicEq else Icons.Default.Mic,
+                                contentDescription = null,
+                                tint = if (isRecording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    if (isRecording) "Recording ${formatDuration(recordingElapsedMs)}" else "Voice note",
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    when {
+                                        isRecording -> "Speak naturally. The original audio will be preserved."
+                                        !speechModelReady && speechDownloadProgress > 0 ->
+                                            "Speech model downloading · $speechDownloadProgress%"
+                                        !speechModelReady -> "First transcription downloads a 74 MB offline model."
+                                        else -> "Transcribed privately on this device."
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        if (isRecording) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Button(
+                                    onClick = {
+                                        viewModel.stopVoiceRecording(title) { onDismiss() }
+                                    },
+                                    enabled = !isVoiceCaptureBusy,
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Icon(Icons.Default.Stop, contentDescription = null)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(if (isVoiceCaptureBusy) "Saving…" else "Stop & save")
+                                }
+                                TextButton(
+                                    onClick = { viewModel.cancelVoiceRecording() },
+                                    enabled = !isVoiceCaptureBusy
+                                ) { Text("Discard") }
+                            }
+                        } else {
+                            OutlinedButton(
+                                onClick = {
+                                    if (
+                                        ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                                        PackageManager.PERMISSION_GRANTED
+                                    ) {
+                                        viewModel.startVoiceRecording()
+                                    } else {
+                                        microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+                                    }
+                                },
+                                enabled = !isVoiceCaptureBusy,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(Icons.Default.Mic, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Record voice note")
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+            } else if (existingNote.audioPath != null) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainer
+                ) {
+                    Row(
+                        modifier = Modifier.padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = { viewModel.togglePlayback(existingNote) }) {
+                            Icon(
+                                if (playingNoteId == existingNote.id) Icons.Default.Stop else Icons.Default.PlayArrow,
+                                contentDescription = if (playingNoteId == existingNote.id) "Stop audio" else "Play audio"
+                            )
+                        }
+                        Column(Modifier.weight(1f)) {
+                            Text("Original recording", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "${formatDuration(existingNote.audioDurationMs ?: 0L)} · ${transcriptionLabel(existingNote.transcriptionStatus, false)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        if (existingNote.transcriptionStatus == TranscriptionStatus.FAILED) {
+                            TextButton(onClick = { viewModel.retryTranscription(existingNote) }) {
+                                Text("Retry")
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+            }
             OutlinedTextField(
                 value = title,
                 onValueChange = { title = it },
@@ -435,7 +615,7 @@ private fun NoteComposerSheet(
                 onClick = {
                     viewModel.saveNote(existingNote, title, content) { onDismiss() }
                 },
-                enabled = content.isNotBlank() && !isIngesting,
+                enabled = content.isNotBlank() && !isIngesting && !isRecording && !isVoiceCaptureBusy,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
                 shape = RoundedCornerShape(14.dp)
             ) {
@@ -915,12 +1095,36 @@ fun ChatBubble(message: ChatMessageItem) {
 
 private fun noteDisplayTitle(note: NoteDocument): String {
     if (note.title.isNotBlank()) return note.title
+    if (note.audioPath != null && note.content.isBlank()) return "Voice note"
     return note.content
         .lineSequence()
         .map { it.trim() }
         .firstOrNull { it.isNotBlank() }
         ?.take(72)
         ?: "Untitled note"
+}
+
+private fun notePreviewText(note: NoteDocument): String = when {
+    note.content.isNotBlank() -> note.content.trim()
+    note.audioPath != null -> transcriptionLabel(note.transcriptionStatus, false)
+    else -> "Empty note"
+}
+
+private fun transcriptionLabel(status: TranscriptionStatus, isProcessing: Boolean): String = when {
+    isProcessing && status == TranscriptionStatus.PENDING -> "Preparing offline transcription…"
+    status == TranscriptionStatus.DOWNLOADING -> "Downloading speech model…"
+    status == TranscriptionStatus.TRANSCRIBING -> "Transcribing on device…"
+    status == TranscriptionStatus.COMPLETE -> "Transcript ready"
+    status == TranscriptionStatus.FAILED -> "Transcription needs attention"
+    status == TranscriptionStatus.PENDING -> "Waiting to transcribe…"
+    else -> "Voice recording"
+}
+
+private fun formatDuration(milliseconds: Long): String {
+    val totalSeconds = (milliseconds.coerceAtLeast(0L) / 1_000L)
+    val minutes = totalSeconds / 60L
+    val seconds = totalSeconds % 60L
+    return "%d:%02d".format(minutes, seconds)
 }
 
 private fun formatNoteDateTime(timestampSeconds: Double): String {

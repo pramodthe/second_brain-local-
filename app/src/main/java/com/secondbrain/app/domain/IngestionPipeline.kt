@@ -8,6 +8,7 @@ import com.secondbrain.app.data.EntityNode
 import com.secondbrain.app.data.ExtractedKnowledge
 import com.secondbrain.app.data.NoteDocument
 import com.secondbrain.app.data.RelationEdge
+import com.secondbrain.app.data.TranscriptionStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.util.UUID
@@ -29,7 +30,10 @@ class IngestionPipeline(
     suspend fun capture(
         title: String,
         content: String,
-        source: String = "manual"
+        source: String = "manual",
+        audioPath: String? = null,
+        audioDurationMs: Long? = null,
+        transcriptionStatus: TranscriptionStatus = TranscriptionStatus.NONE
     ): Result<NoteDocument> = withContext(Dispatchers.IO) {
         runCatching {
             val capturedAt = System.currentTimeMillis() / 1000.0
@@ -39,7 +43,10 @@ class IngestionPipeline(
                 content = content,
                 timestamp = capturedAt,
                 source = source,
-                modifiedTimestamp = capturedAt
+                modifiedTimestamp = capturedAt,
+                audioPath = audioPath,
+                audioDurationMs = audioDurationMs,
+                transcriptionStatus = transcriptionStatus
             )
             store.putNote(note).getOrThrow()
             note

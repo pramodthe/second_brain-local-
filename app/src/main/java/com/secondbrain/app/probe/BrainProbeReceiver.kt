@@ -6,6 +6,7 @@ import android.content.Intent
 import android.util.Log
 import com.secondbrain.app.ai.EmbedderEngine
 import com.secondbrain.app.ai.LlmEngine
+import com.secondbrain.app.ai.SpeechEngine
 import com.secondbrain.app.data.BrainStore
 import com.secondbrain.app.domain.HybridRetriever
 import com.secondbrain.app.domain.IngestionPipeline
@@ -23,13 +24,36 @@ class BrainProbeReceiver : BroadcastReceiver() {
         val pending = goAsync()
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                runDiagnostic(context.applicationContext)
+                if (intent?.getBooleanExtra(EXTRA_SPEECH_ONLY, false) == true) {
+                    runSpeechDiagnostic(context.applicationContext)
+                } else {
+                    runDiagnostic(context.applicationContext)
+                }
             } catch (t: Throwable) {
                 Log.e(TAG, "BrainProbe failed with exception", t)
             } finally {
                 pending.finish()
             }
         }
+    }
+
+    private suspend fun runSpeechDiagnostic(context: Context) {
+        Log.i(TAG, "================== START SPEECH PROBE ==================")
+        val speech = SpeechEngine(context)
+        val sample = context.filesDir.resolve("probe/speech-test.wav")
+        try {
+            check(sample.isFile) { "Missing synthetic test WAV at ${sample.absolutePath}" }
+            check(speech.isModelReady()) { "Speech model is not installed" }
+            val device = speech.load().getOrThrow()
+            val transcript = speech.transcribe(sample).getOrThrow()
+            Log.i(TAG, "SPEECH PASS: device=$device duration=${transcript.audioDurationMs}ms rtf=${transcript.realTimeFactor}")
+            Log.i(TAG, "SPEECH TRANSCRIPT: ${transcript.text}")
+        } catch (error: Throwable) {
+            Log.e(TAG, "SPEECH FAIL: ${error.message}", error)
+        } finally {
+            speech.release()
+        }
+        Log.i(TAG, "================== SPEECH PROBE COMPLETE ==================")
     }
 
     private suspend fun runDiagnostic(context: Context) {
@@ -98,5 +122,6 @@ class BrainProbeReceiver : BroadcastReceiver() {
 
     companion object {
         private const val TAG = "BrainProbe"
+        private const val EXTRA_SPEECH_ONLY = "speech_only"
     }
 }

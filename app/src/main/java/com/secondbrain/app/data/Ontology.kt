@@ -37,6 +37,20 @@ enum class RelationType(val label: String) {
     }
 }
 
+enum class TranscriptionStatus {
+    NONE,
+    PENDING,
+    DOWNLOADING,
+    TRANSCRIBING,
+    COMPLETE,
+    FAILED;
+
+    companion object {
+        fun fromString(value: String): TranscriptionStatus =
+            entries.firstOrNull { it.name.equals(value, ignoreCase = true) } ?: NONE
+    }
+}
+
 data class EntityNode(
     val name: String,
     val category: EntityCategory,
@@ -57,7 +71,10 @@ data class NoteDocument(
     val content: String,
     val timestamp: Double = System.currentTimeMillis() / 1000.0,
     val source: String = "manual",
-    val modifiedTimestamp: Double = timestamp
+    val modifiedTimestamp: Double = timestamp,
+    val audioPath: String? = null,
+    val audioDurationMs: Long? = null,
+    val transcriptionStatus: TranscriptionStatus = TranscriptionStatus.NONE
 )
 
 data class ExtractedKnowledge(
