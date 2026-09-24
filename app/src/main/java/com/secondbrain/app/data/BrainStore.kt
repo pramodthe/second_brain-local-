@@ -224,16 +224,37 @@ class BrainStore(private val context: Context) {
 
                 val anchors = entityNames.map { esc(it.lowercase().trim()) }.filter { it.isNotBlank() }
                 val filterClause = anchors.joinToString(" or ") { a ->
-                    """str_includes(lowercase(source), "$a") or str_includes(lowercase(target), "$a")"""
+                    "lowercase(source) == \"$a\" or lowercase(target) == \"$a\""
                 }
 
-                // Query 1: Edges connected to anchor entities
+                // Query 1: first-hop edges connected to anchor entities.
                 val edgeQuery = """
                     ?[source, relation, target, at] := *edge{source, relation, target, at},
                         ($filterClause)
                     :limit 30
                 """.trimIndent()
-                val edgeRows = d.run(edgeQuery)
+                val firstHopRows = d.run(edgeQuery)
+                val firstHopNames = (
+                    entityNames +
+                        firstHopRows.map { it.rows[0].asString() } +
+                        firstHopRows.map { it.rows[2].asString() }
+                    ).distinct()
+                val secondHopFilter = firstHopNames
+                    .map { esc(it.lowercase().trim()) }
+                    .filter { it.isNotBlank() }
+                    .joinToString(" or ") { name ->
+                        "lowercase(source) == \"$name\" or lowercase(target) == \"$name\""
+                    }
+                val secondHopRows = if (secondHopFilter.isBlank()) emptyList() else d.run(
+                    """
+                    ?[source, relation, target, at] := *edge{source, relation, target, at},
+                        ($secondHopFilter)
+                    :limit 60
+                    """.trimIndent()
+                )
+                val edgeRows = (firstHopRows + secondHopRows).distinctBy { row ->
+                    "${row.rows[0].asString()}|${row.rows[1].asString()}|${row.rows[2].asString()}"
+                }
                 val edgeQualities = loadEdgeQualities(d)
                 val edges = edgeRows.map { r ->
                     val source = r.rows[0].asString()
@@ -256,7 +277,7 @@ class BrainStore(private val context: Context) {
                 val touchedNames = (entityNames + edges.map { it.source } + edges.map { it.target }).distinct()
                 val entityFilter = touchedNames.map { esc(it.lowercase().trim()) }.filter { it.isNotBlank() }
                     .joinToString(" or ") { n ->
-                        """str_includes(lowercase(name), "$n")"""
+                        "lowercase(name) == \"$n\""
                     }
                 val entityQuery = """
                     ?[name, category, description, at] := *entity{name, category, description, at},
@@ -282,8 +303,10 @@ class BrainStore(private val context: Context) {
                 }
 
                 // Query 3: Notes referencing these entities
-                val noteFilter = anchors.joinToString(" or ") { a ->
-                    """str_includes(lowercase(entity_name), "$a")"""
+                val noteFilter = touchedNames.map { esc(it.lowercase().trim()) }
+                    .filter { it.isNotBlank() }
+                    .joinToString(" or ") { a ->
+                        "lowercase(entity_name) == \"$a\""
                 }
                 val noteQuery = """
                     ?[id, title, content, at, source] := *note_entity{note_id: id, entity_name},
@@ -366,6 +389,19 @@ class BrainStore(private val context: Context) {
                     status = quality?.status ?: KnowledgeStatus.ACCEPTED
                 )
             }
+        }
+    }
+
+    /** Returns accepted graph entity names linked to each note. */
+    suspend fun getNoteEntityNames(): Result<Map<String, Set<String>>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            d.run("?[note_id, entity_name] := *note_entity{note_id, entity_name}")
+                .groupBy(
+                    keySelector = { it.rows[0].asString() },
+                    valueTransform = { it.rows[1].asString() }
+                )
+                .mapValues { (_, names) -> names.toSet() }
         }
     }
 

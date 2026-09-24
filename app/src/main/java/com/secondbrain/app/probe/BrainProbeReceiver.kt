@@ -30,6 +30,8 @@ class BrainProbeReceiver : BroadcastReceiver() {
                     runSpeechDiagnostic(context.applicationContext)
                 } else if (intent?.getBooleanExtra(EXTRA_QUEUE_ONLY, false) == true) {
                     runQueueDiagnostic(context.applicationContext)
+                } else if (intent?.getBooleanExtra(EXTRA_RETRIEVAL_ONLY, false) == true) {
+                    runRetrievalDiagnostic(context.applicationContext)
                 } else {
                     runDiagnostic(context.applicationContext)
                 }
@@ -39,6 +41,42 @@ class BrainProbeReceiver : BroadcastReceiver() {
                 pending.finish()
             }
         }
+    }
+
+    private suspend fun runRetrievalDiagnostic(context: Context) {
+        Log.i(TAG, "================== START RETRIEVAL PROBE ==================")
+        val store = BrainStore(context)
+        val embedder = EmbedderEngine(context)
+        try {
+            store.open().getOrThrow()
+            val retriever = HybridRetriever(store, embedder)
+            val result = retriever.retrieve("Why did we choose Event Sourcing for Project Apollo?", topK = 5)
+            check(result.rankedSources.isNotEmpty()) { "No ranked sources returned" }
+            check(result.rankedSources.map { it.note.id }.distinct().size == result.rankedSources.size) {
+                "Duplicate ranked source IDs"
+            }
+            check(result.rankedSources.map { it.number } == (1..result.rankedSources.size).toList()) {
+                "Source numbering is not contiguous"
+            }
+            check(result.timelineNotes.zipWithNext().all { (a, b) -> a.timestamp <= b.timestamp }) {
+                "Timeline is not chronological"
+            }
+            val source = result.rankedSources.first().note
+            val related = retriever.findRelatedNotes(source, limit = 5)
+            check(related.none { it.note.id == source.id }) { "Related results included their source note" }
+            Log.i(
+                TAG,
+                "RETRIEVAL PASS: sources=${result.rankedSources.map { "[${it.number}] ${it.note.title} ${"%.3f".format(it.score)}" }}"
+            )
+            Log.i(TAG, "RELATED PASS: source='${source.title}' results=${related.map { it.note.title }}")
+            Log.i(TAG, "TIMELINE PASS: ${result.timelineNotes.size} notes in chronological order")
+        } catch (error: Throwable) {
+            Log.e(TAG, "RETRIEVAL FAIL: ${error.message}", error)
+        } finally {
+            embedder.close()
+            store.close()
+        }
+        Log.i(TAG, "================== RETRIEVAL PROBE COMPLETE ==================")
     }
 
     private suspend fun runQueueDiagnostic(context: Context) {
@@ -146,6 +184,22 @@ class BrainProbeReceiver : BroadcastReceiver() {
         Log.i(TAG, "   Anchors: ${retrievedContext.anchorEntities.map { "${it.name} (${it.category.name})" }}")
         Log.i(TAG, "   Edges: ${retrievedContext.connectedEdges.map { "${it.source} -[${it.relation.name}]-> ${it.target}" }}")
         Log.i(TAG, "   Notes: ${retrievedContext.relatedNotes.map { it.title }}")
+        Log.i(
+            TAG,
+            "   Ranked sources: ${retrievedContext.rankedSources.map { "[${it.number}] ${it.note.title} score=${"%.3f".format(it.score)} reasons=${it.reasons}" }}"
+        )
+        Log.i(TAG, "   Timeline: ${retrievedContext.timelineNotes.map { it.title }}")
+
+        // 7. Test related-note discovery without returning the source note itself.
+        val relatedSource = store.getRecentNotes(100).getOrThrow().firstOrNull { it.source == "probe" }
+        if (relatedSource != null) {
+            val related = retriever.findRelatedNotes(relatedSource, limit = 4)
+            check(related.none { it.note.id == relatedSource.id }) { "Related search returned its source note" }
+            Log.i(
+                TAG,
+                "TEST 7 PASS: Related to '${relatedSource.title}' = ${related.map { "${it.note.title} (${"%.3f".format(it.score)})" }}"
+            )
+        }
 
         Log.i(TAG, "================== BRAIN PROBE COMPLETE ==================")
     }
@@ -154,5 +208,6 @@ class BrainProbeReceiver : BroadcastReceiver() {
         private const val TAG = "BrainProbe"
         private const val EXTRA_SPEECH_ONLY = "speech_only"
         private const val EXTRA_QUEUE_ONLY = "queue_only"
+        private const val EXTRA_RETRIEVAL_ONLY = "retrieval_only"
     }
 }

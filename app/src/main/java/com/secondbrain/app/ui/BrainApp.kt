@@ -21,6 +21,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.LibraryBooks
+import androidx.compose.material.icons.automirrored.filled.ManageSearch
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.FactCheck
 import androidx.compose.material.icons.filled.*
@@ -46,10 +47,13 @@ import com.secondbrain.app.data.ProcessingJob
 import com.secondbrain.app.data.ProcessingJobStatus
 import com.secondbrain.app.data.ProcessingJobType
 import com.secondbrain.app.data.RelationEdge
+import com.secondbrain.app.data.RetrievedSource
 import com.secondbrain.app.data.TranscriptionStatus
 import androidx.core.content.ContextCompat
 import java.text.DateFormat
+import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.Locale
 
 enum class BrainTab(val label: String) {
     NOTES("Notes"),
@@ -188,16 +192,22 @@ fun NotesScreen(
     val processingNoteIds by viewModel.processingNoteIds.collectAsState()
     val speechProcessingNoteIds by viewModel.speechProcessingNoteIds.collectAsState()
     val playingNoteId by viewModel.playingNoteId.collectAsState()
+    val searchResults by viewModel.noteSearchResults.collectAsState()
+    val isSearchingNotes by viewModel.isSearchingNotes.collectAsState()
+    val relatedToNote by viewModel.relatedToNote.collectAsState()
+    val relatedNotes by viewModel.relatedNotes.collectAsState()
+    val isLoadingRelatedNotes by viewModel.isLoadingRelatedNotes.collectAsState()
     var searchQuery by rememberSaveable { mutableStateOf("") }
+    var notesMode by rememberSaveable { mutableStateOf(NotesMode.RECENT) }
 
-    val visibleNotes = remember(notes, searchQuery) {
-        val query = searchQuery.trim()
-        if (query.isBlank()) notes else notes.filter {
-            it.title.contains(query, ignoreCase = true) ||
-                it.content.contains(query, ignoreCase = true) ||
-                it.source.contains(query, ignoreCase = true)
-        }
+    LaunchedEffect(searchQuery) {
+        viewModel.searchNotes(searchQuery)
     }
+
+    val visibleNotes = remember(notes, searchQuery, searchResults) {
+        if (searchQuery.isBlank()) notes else searchResults.map { it.note }
+    }
+    val searchByNoteId = remember(searchResults) { searchResults.associateBy { it.note.id } }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -221,6 +231,27 @@ fun NotesScreen(
                 singleLine = true,
                 shape = RoundedCornerShape(18.dp)
             )
+            if (isSearchingNotes) {
+                Spacer(Modifier.height(8.dp))
+                LinearProgressIndicator(Modifier.fillMaxWidth().clip(CircleShape))
+            }
+        }
+
+        if (searchQuery.isBlank()) item {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = notesMode == NotesMode.RECENT,
+                    onClick = { notesMode = NotesMode.RECENT },
+                    leadingIcon = { Icon(Icons.Default.ViewAgenda, null, Modifier.size(18.dp)) },
+                    label = { Text("Recent") }
+                )
+                FilterChip(
+                    selected = notesMode == NotesMode.TIMELINE,
+                    onClick = { notesMode = NotesMode.TIMELINE },
+                    leadingIcon = { Icon(Icons.Default.Timeline, null, Modifier.size(18.dp)) },
+                    label = { Text("Timeline") }
+                )
+            }
         }
 
         item {
@@ -242,7 +273,11 @@ fun NotesScreen(
             ) {
                 Column {
                     Text(
-                        if (searchQuery.isBlank()) "Recent notes" else "Search results",
+                        when {
+                            searchQuery.isNotBlank() -> "Smart search results"
+                            notesMode == NotesMode.TIMELINE -> "Knowledge timeline"
+                            else -> "Recent notes"
+                        },
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold
                     )
@@ -256,23 +291,56 @@ fun NotesScreen(
             }
         }
 
-        if (visibleNotes.isEmpty()) {
+        if (visibleNotes.isEmpty() && !isSearchingNotes) {
             item { EmptyNotesState(searchQuery.isNotBlank(), onNewNote) }
+        } else if (searchQuery.isBlank() && notesMode == NotesMode.TIMELINE) {
+            notes.groupBy(::timelineDayLabel).forEach { (day, dayNotes) ->
+                item(key = "day-$day") { TimelineDayHeader(day, dayNotes.size) }
+                items(dayNotes, key = { "timeline-${it.id}" }) { note ->
+                    NoteCard(
+                        note = note,
+                        isProcessing = note.id in processingNoteIds,
+                        isSpeechProcessing = note.id in speechProcessingNoteIds,
+                        isPlaying = note.id == playingNoteId,
+                        onOpen = { onEditNote(note) },
+                        onRelated = { viewModel.showRelatedNotes(note) },
+                        onTogglePlayback = { viewModel.togglePlayback(note) },
+                        onRetryTranscription = { viewModel.retryTranscription(note) }
+                    )
+                }
+            }
         } else {
             items(visibleNotes, key = { it.id }) { note ->
                 NoteCard(
                     note = note,
+                    retrieval = searchByNoteId[note.id],
                     isProcessing = note.id in processingNoteIds,
                     isSpeechProcessing = note.id in speechProcessingNoteIds,
                     isPlaying = note.id == playingNoteId,
                     onOpen = { onEditNote(note) },
+                    onRelated = { viewModel.showRelatedNotes(note) },
                     onTogglePlayback = { viewModel.togglePlayback(note) },
                     onRetryTranscription = { viewModel.retryTranscription(note) }
                 )
             }
         }
     }
+
+    relatedToNote?.let { sourceNote ->
+        RelatedNotesSheet(
+            sourceNote = sourceNote,
+            results = relatedNotes,
+            isLoading = isLoadingRelatedNotes,
+            onDismiss = viewModel::closeRelatedNotes,
+            onOpen = { related ->
+                viewModel.closeRelatedNotes()
+                onEditNote(related)
+            }
+        )
+    }
 }
+
+private enum class NotesMode { RECENT, TIMELINE }
 
 @Composable
 private fun LibraryStat(
@@ -327,12 +395,130 @@ private fun EmptyNotesState(isSearching: Boolean, onNewNote: () -> Unit) {
 }
 
 @Composable
+private fun TimelineDayHeader(day: String, count: Int) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer) {
+            Icon(Icons.Default.History, null, Modifier.padding(8.dp).size(18.dp))
+        }
+        Spacer(Modifier.width(10.dp))
+        Column {
+            Text(day, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleSmall)
+            Text(
+                "$count ${if (count == 1) "memory" else "memories"}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        HorizontalDivider(Modifier.weight(1f), color = MaterialTheme.colorScheme.outlineVariant)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun RelatedNotesSheet(
+    sourceNote: NoteDocument,
+    results: List<RetrievedSource>,
+    isLoading: Boolean,
+    onDismiss: () -> Unit,
+    onOpen: (NoteDocument) -> Unit
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
+            Text("Related notes", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                "Connections to ${noteDisplayTitle(sourceNote)}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(18.dp))
+            when {
+                isLoading -> {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(12.dp))
+                    Text("Following semantic and graph connections…")
+                }
+
+                results.isEmpty() -> {
+                    Column(
+                        Modifier.fillMaxWidth().padding(vertical = 48.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Icon(Icons.Default.Hub, null, Modifier.size(42.dp), tint = MaterialTheme.colorScheme.outline)
+                        Spacer(Modifier.height(12.dp))
+                        Text("No strong connections yet", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Related memories appear as your library grows.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                else -> LazyColumn(
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 600.dp),
+                    contentPadding = PaddingValues(bottom = 32.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(results, key = { "related-${it.note.id}" }) { result ->
+                        Card(
+                            onClick = { onOpen(result.note) },
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
+                        ) {
+                            Column(Modifier.padding(14.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        noteDisplayTitle(result.note),
+                                        modifier = Modifier.weight(1f),
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        "${(result.score * 100).toInt()}%",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                Spacer(Modifier.height(5.dp))
+                                Text(
+                                    result.excerpt,
+                                    maxLines = 3,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                Spacer(Modifier.height(7.dp))
+                                Text(
+                                    result.reasons.joinToString(" · "),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+@Composable
 fun NoteCard(
     note: NoteDocument,
+    retrieval: RetrievedSource? = null,
     isProcessing: Boolean,
     isSpeechProcessing: Boolean,
     isPlaying: Boolean,
     onOpen: () -> Unit,
+    onRelated: () -> Unit,
     onTogglePlayback: () -> Unit,
     onRetryTranscription: () -> Unit
 ) {
@@ -363,20 +549,45 @@ fun NoteCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+                IconButton(onClick = onRelated) {
+                    Icon(
+                        Icons.Default.AccountTree,
+                        contentDescription = "Find related notes",
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
                 Icon(
                     Icons.AutoMirrored.Filled.KeyboardArrowRight,
                     contentDescription = "Open note",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 12.dp)
                 )
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                notePreviewText(note),
+                retrieval?.excerpt ?: notePreviewText(note),
                 style = MaterialTheme.typography.bodyLarge,
                 maxLines = 3,
                 overflow = TextOverflow.Ellipsis,
                 lineHeight = 24.sp
             )
+            retrieval?.let { result ->
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.ManageSearch, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        "${(result.score * 100).toInt()}% match · ${result.reasons.joinToString()}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
             Spacer(Modifier.height(14.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
@@ -1431,17 +1642,55 @@ fun ChatBubble(message: ChatMessageItem) {
 
                     AnimatedVisibility(expandedSources) {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            context.relatedNotes.distinctBy { it.id }.take(4).forEach { note ->
+                            val rankedSources = context.rankedSources.ifEmpty {
+                                context.relatedNotes.distinctBy { it.id }.take(5).mapIndexed { index, note ->
+                                    RetrievedSource(index + 1, note, 0.0, note.content.take(240))
+                                }
+                            }
+                            rankedSources.forEach { source ->
                                 Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surface) {
                                     Column(Modifier.padding(10.dp)) {
-                                        Text(noteDisplayTitle(note), fontWeight = FontWeight.SemiBold)
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer) {
+                                                Text(
+                                                    source.number.toString(),
+                                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                            }
+                                            Spacer(Modifier.width(8.dp))
+                                            Text(
+                                                noteDisplayTitle(source.note),
+                                                modifier = Modifier.weight(1f),
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            if (source.score > 0.0) {
+                                                Text(
+                                                    "${(source.score * 100).toInt()}%",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.primary
+                                                )
+                                            }
+                                        }
+                                        Spacer(Modifier.height(5.dp))
                                         Text(
-                                            note.content,
-                                            maxLines = 2,
+                                            source.excerpt,
+                                            maxLines = 3,
                                             overflow = TextOverflow.Ellipsis,
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
+                                        if (source.reasons.isNotEmpty()) {
+                                            Spacer(Modifier.height(4.dp))
+                                            Text(
+                                                source.reasons.joinToString(" · "),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.outline
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -1498,3 +1747,7 @@ private fun formatNoteDateTime(timestampSeconds: Double): String {
     val milliseconds = (timestampSeconds * 1_000).toLong()
     return DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(milliseconds))
 }
+
+private fun timelineDayLabel(note: NoteDocument): String =
+    SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault())
+        .format(Date((note.timestamp * 1_000).toLong()))

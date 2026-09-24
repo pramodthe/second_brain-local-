@@ -101,8 +101,18 @@ data class ExtractedKnowledge(
     val relations: List<RelationEdge>
 )
 
+data class RetrievedSource(
+    val number: Int,
+    val note: NoteDocument,
+    val score: Double,
+    val excerpt: String,
+    val reasons: List<String> = emptyList()
+)
+
 data class SubgraphContext(
     val anchorEntities: List<EntityNode>,
     val connectedEdges: List<RelationEdge>,
-    val relatedNotes: List<NoteDocument>
+    val relatedNotes: List<NoteDocument>,
+    val rankedSources: List<RetrievedSource> = emptyList(),
+    val timelineNotes: List<NoteDocument> = emptyList()
 )

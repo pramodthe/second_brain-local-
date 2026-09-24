@@ -16,6 +16,7 @@ import com.secondbrain.app.data.EntityNode
 import com.secondbrain.app.data.ExtractedKnowledge
 import com.secondbrain.app.data.RelationEdge
 import com.secondbrain.app.data.RelationType
+import com.secondbrain.app.data.RetrievedSource
 import com.secondbrain.app.data.SubgraphContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -244,27 +245,71 @@ class LlmEngine(private val context: Context) {
         operationMutex.withLock {
             val engine = llm
             if (engine == null) {
-                emit("*(On-Device LLM is not loaded yet)*\n\n**Retrieved Graph Context:**\n")
-                context.anchorEntities.forEach { emit("• **${it.name}** (${it.category.name}): ${it.description}\n") }
-                context.connectedEdges.forEach { emit("  └─ [${it.relation.name}] → ${it.target}\n") }
-                if (context.relatedNotes.isNotEmpty()) {
-                    emit("\n**Related Notes:**\n")
-                    context.relatedNotes.forEach { emit("• ${it.title}: ${it.content.take(150)}...\n") }
+                emit("The on-device model is not loaded, but I found these relevant passages:\n\n")
+                val sources = context.rankedSources.ifEmpty {
+                    context.relatedNotes.mapIndexed { index, note ->
+                        RetrievedSource(
+                            number = index + 1,
+                            note = note,
+                            score = 0.0,
+                            excerpt = note.content.take(240)
+                        )
+                    }
+                }
+                if (sources.isEmpty()) {
+                    emit("I couldn't find supporting information in your saved notes.")
+                } else {
+                    sources.forEach { source ->
+                        emit("[${source.number}] ${source.note.title.ifBlank { "Untitled note" }} — ${source.excerpt}\n")
+                    }
                 }
                 return@withLock
             }
 
+            val sources = context.rankedSources.ifEmpty {
+                context.relatedNotes.mapIndexed { index, note ->
+                    RetrievedSource(
+                        number = index + 1,
+                        note = note,
+                        score = 0.0,
+                        excerpt = note.content.take(240)
+                    )
+                }
+            }
+            val sourceNumberByNoteId = sources.associate { it.note.id to it.number }
             val contextStr = buildString {
-                appendLine("=== KNOWLEDGE GRAPH ENTITIES ===")
-                context.anchorEntities.forEach { appendLine("- ${it.name} [${it.category.name}]: ${it.description}") }
-                appendLine("\n=== GRAPH RELATIONS ===")
-                context.connectedEdges.forEach { appendLine("- (${it.source}) -[${it.relation.name}]-> (${it.target})") }
-                appendLine("\n=== RELEVANT NOTES ===")
-                context.relatedNotes.forEach { appendLine("Note '${it.title}': ${it.content}") }
+                appendLine("=== ACCEPTED KNOWLEDGE GRAPH ENTITIES ===")
+                context.anchorEntities.forEach { entity ->
+                    sourceNumberByNoteId[entity.sourceNoteId]?.let { sourceNumber ->
+                        appendLine("- ${entity.name} [${entity.category.name}]: ${entity.description} [$sourceNumber]")
+                    }
+                }
+                appendLine("\n=== ACCEPTED GRAPH RELATIONS ===")
+                context.connectedEdges.forEach { edge ->
+                    sourceNumberByNoteId[edge.sourceNoteId]?.let { sourceNumber ->
+                        appendLine(
+                            "- (${edge.source}) -[${edge.relation.name}]-> (${edge.target}); " +
+                                "evidence: ${edge.evidence} [$sourceNumber]"
+                        )
+                    }
+                }
+                appendLine("\n=== NUMBERED NOTE SOURCES ===")
+                sources.forEach { source ->
+                    appendLine(
+                        "[${source.number}] ${source.note.title.ifBlank { "Untitled note" }}: " +
+                            source.note.content.take(1_800)
+                    )
+                }
             }
 
             val msgs = arrayOf(
-                ChatMessage("system", "You are the user's personal Second Brain. Answer questions accurately based strictly on the provided Knowledge Graph context and notes. Cite connected entities and relations when relevant."),
+                ChatMessage(
+                    "system",
+                    "You are the user's private Second Brain. Answer only from the provided accepted graph and numbered notes. " +
+                        "Cite factual statements with square-bracket source numbers such as [1] or [2]. " +
+                        "Never invent a citation or use a number not present in the sources. " +
+                        "If the sources do not support an answer, say that clearly. Be concise and distinguish fact from inference."
+                ),
                 ChatMessage("user", "Context:\n$contextStr\n\nQuestion: $query")
             )
 

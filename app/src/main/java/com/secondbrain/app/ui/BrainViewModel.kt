@@ -18,6 +18,7 @@ import com.secondbrain.app.data.ProcessingJob
 import com.secondbrain.app.data.ProcessingJobStatus
 import com.secondbrain.app.data.ProcessingJobType
 import com.secondbrain.app.data.RelationEdge
+import com.secondbrain.app.data.RetrievedSource
 import com.secondbrain.app.data.SubgraphContext
 import com.secondbrain.app.data.TranscriptionStatus
 import com.secondbrain.app.domain.HybridRetriever
@@ -42,6 +43,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val voiceRecorder = VoiceRecorder(application)
     private var recordingTickerJob: Job? = null
+    private var noteSearchJob: Job? = null
     private var mediaPlayer: MediaPlayer? = null
 
     val store = BrainStore(application)
@@ -67,6 +69,21 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _chatMessages = MutableStateFlow<List<ChatMessageItem>>(emptyList())
     val chatMessages: StateFlow<List<ChatMessageItem>> = _chatMessages.asStateFlow()
+
+    private val _noteSearchResults = MutableStateFlow<List<RetrievedSource>>(emptyList())
+    val noteSearchResults: StateFlow<List<RetrievedSource>> = _noteSearchResults.asStateFlow()
+
+    private val _isSearchingNotes = MutableStateFlow(false)
+    val isSearchingNotes: StateFlow<Boolean> = _isSearchingNotes.asStateFlow()
+
+    private val _relatedToNote = MutableStateFlow<NoteDocument?>(null)
+    val relatedToNote: StateFlow<NoteDocument?> = _relatedToNote.asStateFlow()
+
+    private val _relatedNotes = MutableStateFlow<List<RetrievedSource>>(emptyList())
+    val relatedNotes: StateFlow<List<RetrievedSource>> = _relatedNotes.asStateFlow()
+
+    private val _isLoadingRelatedNotes = MutableStateFlow(false)
+    val isLoadingRelatedNotes: StateFlow<Boolean> = _isLoadingRelatedNotes.asStateFlow()
 
     private val _isIngesting = MutableStateFlow(false)
     val isIngesting: StateFlow<Boolean> = _isIngesting.asStateFlow()
@@ -140,6 +157,45 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshData() {
         viewModelScope.launch { loadData() }
+    }
+
+    fun searchNotes(query: String) {
+        noteSearchJob?.cancel()
+        if (query.isBlank()) {
+            _noteSearchResults.value = emptyList()
+            _isSearchingNotes.value = false
+            return
+        }
+        noteSearchJob = viewModelScope.launch {
+            _isSearchingNotes.value = true
+            try {
+                delay(220)
+                _noteSearchResults.value = retriever.search(query.trim(), limit = 40)
+            } finally {
+                _isSearchingNotes.value = false
+            }
+        }
+    }
+
+    fun showRelatedNotes(note: NoteDocument) {
+        _relatedToNote.value = note
+        _relatedNotes.value = emptyList()
+        viewModelScope.launch {
+            _isLoadingRelatedNotes.value = true
+            try {
+                _relatedNotes.value = retriever.findRelatedNotes(note)
+            } catch (error: Exception) {
+                _appError.value = "Could not find related notes: ${error.message ?: "unknown error"}"
+            } finally {
+                _isLoadingRelatedNotes.value = false
+            }
+        }
+    }
+
+    fun closeRelatedNotes() {
+        _relatedToNote.value = null
+        _relatedNotes.value = emptyList()
+        _isLoadingRelatedNotes.value = false
     }
 
     private suspend fun loadData() {
@@ -450,7 +506,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
                 _chatMessages.value = _chatMessages.value + userMsg
 
                 // 1. Retrieve hybrid subgraph context
-                val context = retriever.retrieve(query, topK = 4)
+                val context = retriever.retrieve(query, topK = 5)
 
                 // 2. Add assistant placeholder
                 val assistantMsg = ChatMessageItem("brain", "", context, isStreaming = true)

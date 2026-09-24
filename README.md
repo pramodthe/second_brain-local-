@@ -12,7 +12,8 @@ An offline-first Android knowledge workspace that turns notes and shared text in
 - Continue transcription and knowledge extraction through a durable background queue after restarts.
 - Store notes, entities, aliases, evidence, and relationships locally in CozoDB.
 - Keep uncertain entities, relationships, and possible duplicates out of the graph until you review them.
-- Retrieve relevant notes with HNSW vector search, then expand related graph context.
+- Rerank HNSW results with lexical relevance, graph overlap, aliases, and time-aware scoring.
+- Discover related notes, browse a chronological timeline, and inspect cited source passages.
 - Explore the ontology with an interactive force-directed graph or a filtered list.
 - Use a local Qwen GGUF model for extraction and grounded answers when one is installed.
 - Fall back to deterministic local embeddings and rule-based extraction when the model is unavailable.
@@ -44,7 +45,7 @@ Capture is intentionally durable-first. Original text or audio is written to pri
 - **Phase 2 — Voice capture (complete):** durable recordings, playback, offline transcription, visible processing state, and retry.
 - **Phase 3 — Processing queue (complete):** persistent, resumable AI jobs with visible status, retries, cancellation, and deduplication.
 - **Phase 4 — Knowledge quality (complete):** aliases, duplicate resolution, evidence, confidence, and review workflows.
-- **Phase 5 — Retrieval:** stronger search, related notes, timelines, and source-grounded answers.
+- **Phase 5 — Retrieval (complete):** hybrid-ranked search, related notes, timelines, and source-grounded answers.
 - **Phase 6 — Ownership:** encrypted export, backup, restore, and production hardening.
 
 ## Requirements
@@ -107,6 +108,19 @@ The review inbox supports three decisions:
 
 Accepted aliases participate in later entity resolution and Explore search. Entity cards expose confidence, aliases, provenance evidence, and relationship evidence. Existing databases migrate additively: old graph rows remain accepted with their original data, while new quality metadata is stored in separate CozoDB relations.
 
+## Retrieval and grounded answers
+
+Search and chat share one deterministic hybrid retrieval pipeline. It combines four signals:
+
+- CozoDB HNSW cosine distance for semantic similarity.
+- Exact phrases and token coverage across note titles and text.
+- Accepted entity overlap and two-hop knowledge-graph expansion, including aliases.
+- Recency, with stronger weighting for explicitly temporal questions such as “what did I learn recently?”
+
+Results include a relevance score, the matching passage, and human-readable reasons such as `exact phrase`, `shared entities`, or `semantic match`. The connection button on any note opens related memories without returning the source note itself. The Notes screen can also group the library into a chronological timeline.
+
+Chat receives only accepted graph facts and numbered note sources. The system prompt requires square-bracket citations such as `[1]`, refuses unsupported answers, and never sends notes off-device. Expanding **Sources used** beneath an answer shows the exact passages and ranking evidence behind those citations. When the LLM is not loaded, the app still returns the ranked local passages instead of presenting an ungrounded answer.
+
 ## Verify on a device
 
 After installing a debug build, run the diagnostic receiver:
@@ -136,6 +150,16 @@ adb shell am broadcast \
   -n com.secondbrain.app/.probe.BrainProbeReceiver \
   --ez queue_only true
 adb logcat -d -s BrainProbe:V BrainProcessing:V WM-WorkerWrapper:V
+```
+
+To validate hybrid ranking, source numbering, related-note exclusion, and chronological ordering without writing new notes:
+
+```bash
+adb shell am broadcast \
+  -a com.secondbrain.app.PROBE \
+  -n com.secondbrain.app/.probe.BrainProbeReceiver \
+  --ez retrieval_only true
+adb logcat -d -s BrainProbe:V
 ```
 
 ## Project layout
