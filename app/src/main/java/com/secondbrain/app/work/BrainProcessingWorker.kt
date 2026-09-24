@@ -166,10 +166,10 @@ class BrainProcessingWorker(
             llm.loadModel(useGpu = true).getOrThrow()
         }
         ensureNotCancelled(store, job.id)
-        updateJob(store, job, ProcessingJobStatus.RUNNING, 42, "Extracting ideas and relationships")
+        updateJob(store, job, ProcessingJobStatus.RUNNING, 42, "Extracting ideas, actions, and relationships")
         pipeline.enrich(note).getOrThrow()
         ensureNotCancelled(store, job.id)
-        updateJob(store, job, ProcessingJobStatus.RUNNING, 92, "Knowledge graph updated")
+        updateJob(store, job, ProcessingJobStatus.RUNNING, 92, "Knowledge and actions updated")
     }
 
     private suspend fun updateJob(

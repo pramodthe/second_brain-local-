@@ -8,6 +8,8 @@ import com.secondbrain.app.data.NoteDocument
 import com.secondbrain.app.data.TranscriptionStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.ZoneId
 import java.util.UUID
 
 data class IngestionResult(
@@ -15,7 +17,8 @@ data class IngestionResult(
     val entitiesExtracted: Int,
     val relationsExtracted: Int,
     val vectorDimension: Int,
-    val reviewsCreated: Int = 0
+    val reviewsCreated: Int = 0,
+    val actionsExtracted: Int = 0
 )
 
 class IngestionPipeline(
@@ -82,7 +85,10 @@ class IngestionPipeline(
             val embedding = embedder.embed(titleAndContent)
 
             // Step 2: Extract Entities & Relations
-            val extracted = llm.extractOntology(note.content)
+            val capturedDate = Instant.ofEpochSecond(note.timestamp.toLong())
+                .atZone(ZoneId.systemDefault())
+                .toLocalDate()
+            val extracted = llm.extractOntology(note.content, capturedDate)
 
             // Step 3: Trust-aware entity resolution. Only supported, high-confidence
             // knowledge enters the graph; ambiguous proposals go to the review inbox.
@@ -98,6 +104,8 @@ class IngestionPipeline(
             store.removePendingKnowledgeReviews(note.id).getOrThrow()
             store.putNote(note, resolution.accepted, embedding).getOrThrow()
             store.putKnowledgeReviews(resolution.reviews).getOrThrow()
+            val actions = ActionExtractor.toActionItems(note, extracted.actions)
+            store.syncOpenActionItems(note.id, actions).getOrThrow()
 
             Log.i(
                 TAG,
@@ -110,7 +118,8 @@ class IngestionPipeline(
                 entitiesExtracted = resolution.accepted.entities.size,
                 relationsExtracted = resolution.accepted.relations.size,
                 vectorDimension = embedding.size,
-                reviewsCreated = resolution.reviews.size
+                reviewsCreated = resolution.reviews.size,
+                actionsExtracted = actions.size
             )
         }
     }

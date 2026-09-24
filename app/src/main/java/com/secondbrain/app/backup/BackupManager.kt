@@ -34,6 +34,7 @@ class BackupManager(
                 val edges = store.getAllEdges().getOrThrow()
                 val noteEntities = store.getNoteEntityNames().getOrThrow()
                 val reviews = store.getAllKnowledgeReviews().getOrThrow()
+                val actions = store.getActionItems(status = null, limit = 100_000).getOrThrow()
                 val audioByNoteId = if (includeRecordings) {
                     notes.mapNotNull { note ->
                         note.audioPath?.let(::File)?.takeIf { it.isFile }?.let { note.id to it }
@@ -56,7 +57,8 @@ class BackupManager(
                     entities = entities,
                     edges = edges,
                     noteEntityNames = noteEntities,
-                    reviews = reviews
+                    reviews = reviews,
+                    actions = actions
                 )
                 val manifest = BackupJson.encode(payload).toByteArray(Charsets.UTF_8)
                 require(manifest.size <= MAX_MANIFEST_BYTES) { "Backup manifest is too large" }
@@ -78,7 +80,7 @@ class BackupManager(
                         }
                     }
                 }
-                BackupReport(notes.size, entities.size, edges.size, audioByNoteId.size)
+                BackupReport(notes.size, entities.size, edges.size, audioByNoteId.size, actions.size)
             } finally {
                 passphrase.fill('\u0000')
             }
@@ -108,6 +110,7 @@ class BackupManager(
                 val manifest = zip.getInputStream(manifestEntry).use { it.readLimited(MAX_MANIFEST_BYTES) }
                 val payload = BackupJson.decode(manifest.toString(Charsets.UTF_8))
                 require(payload.notes.size <= MAX_NOTES) { "Backup contains too many notes" }
+                require(payload.actions.size <= MAX_ACTIONS) { "Backup contains too many actions" }
                 val audioEntries = payload.notes.mapNotNull(BackupNote::audioEntry)
                 require(audioEntries.distinct().size == audioEntries.size) {
                     "Backup contains duplicate recording references"
@@ -159,12 +162,14 @@ class BackupManager(
                 }
                 store.restoreGraph(payload.entities, payload.edges, payload.noteEntityNames).getOrThrow()
                 store.putKnowledgeReviews(payload.reviews).getOrThrow()
+                store.restoreActionItems(payload.actions).getOrThrow()
                 RestoreReport(
                     importedNotes = imported,
                     skippedNewerNotes = skipped,
                     entities = payload.entities.size,
                     edges = payload.edges.size,
-                    recordings = recordingCount
+                    recordings = recordingCount,
+                    actions = payload.actions.size
                 )
             }
         } catch (error: Throwable) {
@@ -212,6 +217,7 @@ class BackupManager(
         private const val MANIFEST_ENTRY = "manifest.json"
         private const val MAX_ENTRIES = 10_000
         private const val MAX_NOTES = 100_000
+        private const val MAX_ACTIONS = 100_000
         private const val MAX_MANIFEST_BYTES = 20L * 1024 * 1024
         private const val MAX_AUDIO_BYTES = 1024L * 1024 * 1024
         private const val MAX_TOTAL_AUDIO_BYTES = 3L * 1024 * 1024 * 1024

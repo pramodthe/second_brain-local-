@@ -7,6 +7,7 @@ An offline-first Android knowledge workspace that turns notes and shared text in
 ## Highlights
 
 - Start from a daily workspace with one-tap text or voice capture, automatic titles, and resurfaced memories.
+- Turn explicit TODOs, reminders, and unchecked checklist lines into local actions with evidence-backed due dates.
 - Capture notes in the app or share plain text from another Android app.
 - Record voice notes, preserve the original audio, play it back, and transcribe it fully offline.
 - Save raw notes immediately, edit them later, and retain created/modified timestamps.
@@ -28,12 +29,16 @@ Voice ----> durable WAV ----> offline transcript <---+                         v
                                                                        CozoDB HNSW index
                                                                               |
                                                 extracted proposals <----------+
-                                                        |
-                                      evidence + confidence + resolution
-                                             /                         \
-                                      accepted                      review inbox
-                                         |                                |
-                                         +--------> knowledge graph <------+
+                                                  /             \
+                                     verified actions       knowledge proposals
+                                              |                   |
+                                        Today / Tasks      evidence + confidence
+                                                                  |
+                                                              resolution
+                                                             /          \
+                                                       accepted      review inbox
+                                                          |               |
+                                                          +-> graph <-----+
                                                         |
 Question -> query embedding -> similar notes -> graph expansion -> local LLM answer
 ```
@@ -66,6 +71,12 @@ The app is packaged only for `arm64-v8a`, because its on-device dependencies inc
 The app opens on **Today**, not the database or graph. Type directly into Quick capture and save without choosing a title, category, or folder; the original note and timestamp are persisted immediately, and a concise title is derived locally from its first meaningful line. Ontology extraction and embeddings continue through the background queue.
 
 The microphone button starts a voice note from the same card. Stopping preserves the original recording first, then queues offline transcription. When the transcript arrives, an untitled voice note receives a local title derived from the transcript. Today also surfaces current processing or review work, the day's recent memories, and one older memory without modifying it.
+
+## Actions and reminders
+
+Explicit action language is extracted during background organization and stored locally with its source note, confidence, evidence, and optional due date. Supported deterministic forms include `TODO:`, `Task:`, `Reminder:`, `remind me to`, `need to`, and Markdown checkboxes such as `- [ ]`. Relative dates such as `today`, `tomorrow`, and `next Monday`, ISO dates, and named dates are resolved against the note's original capture date.
+
+The model may propose additional actions, but the app only saves proposals whose evidence is an exact substring of the note. It does not invent a due date when the quoted evidence has none. Open actions appear on Today and in **Tasks → Actions**, where they can be completed, reopened, or dismissed. Reprocessing an edited note refreshes open proposals without resurrecting completed or dismissed work.
 
 ## Build and run
 
@@ -102,7 +113,7 @@ The engine tries NPU, GPU, and CPU in that order. On the tested RMX5011/Snapdrag
 
 Every transcription and ontology-extraction request is first persisted in CozoDB. Android WorkManager then drains this queue serially so only one heavy on-device inference task runs at a time. Stable job IDs deduplicate repeated requests, while a note edited during processing supersedes the older run and is processed again with its latest contents.
 
-The **Tasks** screen shows queued, running, completed, failed, and cancelled work with progress and attempt counts. Failed or cancelled jobs can be retried; active jobs can be cancelled cooperatively. If Android terminates the process, any interrupted job returns to the queue when WorkManager or the app starts again.
+The **Tasks** screen separates background processing, extracted actions, and knowledge review. It shows queued, running, completed, failed, and cancelled work with progress and attempt counts. Failed or cancelled jobs can be retried; active jobs can be cancelled cooperatively. If Android terminates the process, any interrupted job returns to the queue when WorkManager or the app starts again.
 
 ## Knowledge quality and review
 
@@ -131,7 +142,7 @@ Chat receives only accepted graph facts and numbered note sources. The system pr
 
 ## Encrypted backup and restore
 
-The **Own** screen creates a portable `.sbrain` archive containing notes, accepted graph data, aliases, evidence, review history, and—optionally—voice recordings. Model files are deliberately excluded. Before the archive leaves app-private storage, it is encrypted with AES-256-GCM using a key derived from the user’s passphrase with PBKDF2-HMAC-SHA256 and a unique random salt. The passphrase is never persisted and cannot be recovered by the app.
+The **Own** screen creates a portable `.sbrain` archive containing notes, actions, accepted graph data, aliases, evidence, review history, and—optionally—voice recordings. Model files are deliberately excluded. Before the archive leaves app-private storage, it is encrypted with AES-256-GCM using a key derived from the user’s passphrase with PBKDF2-HMAC-SHA256 and a unique random salt. The passphrase is never persisted and cannot be recovered by the app.
 
 Restore decrypts and validates the authenticated archive, rejects unsafe paths and oversized entries, regenerates local search embeddings, and merges records without deleting the existing library. Notes already present with the same or a newer modification time remain untouched. Restore archives are processed through temporary app-private storage and removed after completion.
 
@@ -175,6 +186,16 @@ adb shell am broadcast \
   -a com.secondbrain.app.PROBE \
   -n com.secondbrain.app/.probe.BrainProbeReceiver \
   --ez retrieval_only true
+adb logcat -d -s BrainProbe:V
+```
+
+To verify action insert, query, status updates, and cleanup without leaving a note or action behind:
+
+```bash
+adb shell am broadcast \
+  -a com.secondbrain.app.PROBE \
+  -n com.secondbrain.app/.probe.BrainProbeReceiver \
+  --ez actions_only true
 adb logcat -d -s BrainProbe:V
 ```
 

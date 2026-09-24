@@ -2,6 +2,8 @@ package com.secondbrain.app.backup
 
 import com.secondbrain.app.data.BackupNote
 import com.secondbrain.app.data.BackupPayload
+import com.secondbrain.app.data.ActionItem
+import com.secondbrain.app.data.ActionStatus
 import com.secondbrain.app.data.EntityCategory
 import com.secondbrain.app.data.EntityNode
 import com.secondbrain.app.data.KnowledgeReviewItem
@@ -28,6 +30,7 @@ internal object BackupJson {
             }
         })
         put("reviews", JSONArray().apply { payload.reviews.forEach { put(encodeReview(it)) } })
+        put("actions", JSONArray().apply { payload.actions.forEach { put(encodeAction(it)) } })
     }.toString()
 
     fun decode(json: String): BackupPayload {
@@ -46,7 +49,8 @@ internal object BackupJson {
             entities = root.getJSONArray("entities").objects().map(::decodeEntity),
             edges = root.getJSONArray("edges").objects().map(::decodeEdge),
             noteEntityNames = noteEntities,
-            reviews = root.optJSONArray("reviews")?.objects()?.map(::decodeReview).orEmpty()
+            reviews = root.optJSONArray("reviews")?.objects()?.map(::decodeReview).orEmpty(),
+            actions = root.optJSONArray("actions")?.objects()?.map(::decodeAction).orEmpty()
         )
     }
 
@@ -156,9 +160,34 @@ internal object BackupJson {
         updatedTimestamp = value.optDouble("updatedTimestamp", 0.0)
     )
 
+    private fun encodeAction(item: ActionItem) = JSONObject().apply {
+        put("id", item.id)
+        put("noteId", item.noteId)
+        put("text", item.text)
+        put("dueTimestamp", item.dueTimestamp ?: JSONObject.NULL)
+        put("status", item.status.name)
+        put("confidence", item.confidence)
+        put("evidence", item.evidence)
+        put("createdTimestamp", item.createdTimestamp)
+        put("updatedTimestamp", item.updatedTimestamp)
+    }
+
+    private fun decodeAction(value: JSONObject) = ActionItem(
+        id = value.getString("id"),
+        noteId = value.getString("noteId"),
+        text = value.getString("text"),
+        dueTimestamp = value.optNullableDouble("dueTimestamp"),
+        status = ActionStatus.fromString(value.optString("status")),
+        confidence = value.optDouble("confidence", 0.0),
+        evidence = value.optString("evidence"),
+        createdTimestamp = value.optDouble("createdTimestamp", 0.0),
+        updatedTimestamp = value.optDouble("updatedTimestamp", 0.0)
+    )
+
     private fun JSONArray.objects(): List<JSONObject> = List(length()) { getJSONObject(it) }
     private fun JSONArray.strings(): List<String> = List(length()) { optString(it) }.filter { it.isNotBlank() }
     private fun JSONObject.optNullableString(key: String): String? =
         if (isNull(key)) null else optString(key).takeIf { it.isNotBlank() }
     private fun JSONObject.optNullableLong(key: String): Long? = if (isNull(key)) null else optLong(key)
+    private fun JSONObject.optNullableDouble(key: String): Double? = if (isNull(key)) null else optDouble(key)
 }

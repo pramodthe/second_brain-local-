@@ -154,7 +154,8 @@ class KnowledgeResolver(
         return KnowledgeResolution(
             accepted = ExtractedKnowledge(
                 acceptedEntities.distinctBy { normalizeName(it.name) },
-                acceptedRelations
+                acceptedRelations,
+                raw.actions
             ),
             reviews = reviews.distinctBy { it.id }
         )

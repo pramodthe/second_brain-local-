@@ -39,11 +39,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.secondbrain.app.data.EntityCategory
 import com.secondbrain.app.data.EntityNode
+import com.secondbrain.app.data.ActionItem
+import com.secondbrain.app.data.ActionStatus
 import com.secondbrain.app.data.KnowledgeReviewItem
 import com.secondbrain.app.data.ReviewKind
 import com.secondbrain.app.data.NoteDocument
@@ -60,6 +64,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
 import java.util.Date
 import java.util.Locale
@@ -240,6 +245,7 @@ fun TodayScreen(
     val notes by viewModel.notes.collectAsState()
     val jobs by viewModel.processingJobs.collectAsState()
     val reviews by viewModel.knowledgeReviews.collectAsState()
+    val actionItems by viewModel.actionItems.collectAsState()
     val isIngesting by viewModel.isIngesting.collectAsState()
     val isRecording by viewModel.isRecording.collectAsState()
     val recordingElapsedMs by viewModel.recordingElapsedMs.collectAsState()
@@ -261,6 +267,14 @@ fun TodayScreen(
     }
     val activeJobs = remember(jobs) { jobs.count { it.status.isActive } }
     val failedJobs = remember(jobs) { jobs.count { it.status == ProcessingJobStatus.FAILED } }
+    val openActions = remember(actionItems) {
+        actionItems.filter { it.status == ActionStatus.OPEN }
+    }
+    val dueNow = remember(openActions) {
+        val today = LocalDate.now()
+        openActions.count { actionDueDate(it)?.isAfter(today) == false }
+    }
+    val notesById = remember(notes) { notes.associateBy(NoteDocument::id) }
     val memoryToResurface = remember(notes, startOfToday) {
         val older = notes.filter { it.timestamp < startOfToday }
         older.takeIf { it.isNotEmpty() }?.let {
@@ -423,8 +437,54 @@ fun TodayScreen(
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 TodayMetric("Captured", todaysNotes.size, Icons.Default.EditNote, Modifier.weight(1f))
-                TodayMetric("Working", activeJobs, Icons.Default.Sync, Modifier.weight(1f))
-                TodayMetric("Attention", reviews.size + failedJobs, Icons.AutoMirrored.Filled.FactCheck, Modifier.weight(1f))
+                TodayMetric("Due", dueNow, Icons.Default.Event, Modifier.weight(1f))
+                TodayMetric("Open", openActions.size, Icons.AutoMirrored.Filled.FactCheck, Modifier.weight(1f))
+            }
+        }
+
+        item {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("Your actions", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (openActions.isEmpty()) "Nothing is waiting for you"
+                        else "${openActions.size} ${if (openActions.size == 1) "open action" else "open actions"}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                TextButton(onClick = onOpenProcessing, enabled = !isRecording) { Text("Manage") }
+            }
+        }
+
+        if (openActions.isEmpty()) {
+            item {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(18.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerLow
+                ) {
+                    Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.TaskAlt, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(12.dp))
+                        Text("Write “TODO: …” or an explicit reminder in any note to see it here.")
+                    }
+                }
+            }
+        } else {
+            items(openActions.take(5), key = { "action-${it.id}" }) { action ->
+                ActionItemCard(
+                    item = action,
+                    sourceNote = notesById[action.noteId],
+                    enabled = !isRecording,
+                    onToggle = { viewModel.updateActionStatus(action, ActionStatus.COMPLETED) },
+                    onDismiss = { viewModel.updateActionStatus(action, ActionStatus.DISMISSED) },
+                    onOpenNote = notesById[action.noteId]?.let { note -> { onEditNote(note) } }
+                )
             }
         }
 
@@ -596,6 +656,94 @@ private fun TodayMemoryRow(note: NoteDocument, enabled: Boolean, onClick: () -> 
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.outline
             )
+        }
+    }
+}
+
+@Composable
+private fun ActionItemCard(
+    item: ActionItem,
+    sourceNote: NoteDocument?,
+    enabled: Boolean = true,
+    onToggle: () -> Unit,
+    onDismiss: (() -> Unit)? = null,
+    onOpenNote: (() -> Unit)? = null
+) {
+    val completed = item.status == ActionStatus.COMPLETED
+    val dueDate = actionDueDate(item)
+    val overdue = item.status == ActionStatus.OPEN && dueDate?.isBefore(LocalDate.now()) == true
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (overdue) MaterialTheme.colorScheme.errorContainer
+            else MaterialTheme.colorScheme.surfaceContainerLow
+        )
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Checkbox(
+                checked = completed,
+                onCheckedChange = { onToggle() },
+                enabled = enabled
+            )
+            Spacer(Modifier.width(4.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    item.text,
+                    fontWeight = FontWeight.Medium,
+                    textDecoration = if (completed) TextDecoration.LineThrough else TextDecoration.None
+                )
+                Spacer(Modifier.height(5.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        if (dueDate == null) Icons.Default.Inbox else Icons.Default.Event,
+                        null,
+                        Modifier.size(15.dp),
+                        tint = if (overdue) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.width(5.dp))
+                    Text(
+                        actionDueLabel(item),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (overdue) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    sourceNote?.let {
+                        Text(" · ", color = MaterialTheme.colorScheme.outline)
+                        if (onOpenNote != null) {
+                            TextButton(
+                                onClick = onOpenNote,
+                                enabled = enabled,
+                                contentPadding = PaddingValues(0.dp),
+                                modifier = Modifier.heightIn(min = 28.dp)
+                            ) {
+                                Text(
+                                    noteDisplayTitle(it),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            }
+                        } else {
+                            Text(
+                                noteDisplayTitle(it),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    }
+                }
+            }
+            if (!completed && onDismiss != null) {
+                IconButton(onClick = onDismiss, enabled = enabled) {
+                    Icon(Icons.Default.Close, contentDescription = "Dismiss action")
+                }
+            }
         }
     }
 }
@@ -1278,16 +1426,22 @@ private fun NoteComposerSheet(
     }
 }
 
+private enum class ActivityMode { PROCESSING, ACTIONS, REVIEW }
+
 @Composable
 fun ProcessingScreen(viewModel: BrainViewModel) {
     val jobs by viewModel.processingJobs.collectAsState()
     val reviews by viewModel.knowledgeReviews.collectAsState()
+    val actionItems by viewModel.actionItems.collectAsState()
     val notes by viewModel.notes.collectAsState()
     val notesById = remember(notes) { notes.associateBy { it.id } }
+    val visibleActions = remember(actionItems) {
+        actionItems.filter { it.status != ActionStatus.DISMISSED }
+    }
     val activeCount = jobs.count { it.status.isActive }
     val failedCount = jobs.count { it.status == ProcessingJobStatus.FAILED }
     val completedCount = jobs.count { it.status == ProcessingJobStatus.COMPLETED }
-    var showReviews by rememberSaveable { mutableStateOf(false) }
+    var mode by rememberSaveable { mutableStateOf(ActivityMode.PROCESSING) }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -1296,21 +1450,31 @@ fun ProcessingScreen(viewModel: BrainViewModel) {
     ) {
         item {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     FilterChip(
-                        selected = !showReviews,
-                        onClick = { showReviews = false },
-                        leadingIcon = { Icon(Icons.Default.Sync, null, Modifier.size(18.dp)) },
-                        label = { Text("Processing") }
+                        selected = mode == ActivityMode.PROCESSING,
+                        onClick = { mode = ActivityMode.PROCESSING },
+                        label = { Text("Jobs") },
+                        modifier = Modifier.weight(1f)
                     )
                     FilterChip(
-                        selected = showReviews,
-                        onClick = { showReviews = true },
-                        leadingIcon = { Icon(Icons.AutoMirrored.Filled.FactCheck, null, Modifier.size(18.dp)) },
-                        label = { Text("Review${if (reviews.isNotEmpty()) " (${reviews.size})" else ""}") }
+                        selected = mode == ActivityMode.ACTIONS,
+                        onClick = { mode = ActivityMode.ACTIONS },
+                        label = { Text("Actions") },
+                        modifier = Modifier.weight(1f)
+                    )
+                    FilterChip(
+                        selected = mode == ActivityMode.REVIEW,
+                        onClick = { mode = ActivityMode.REVIEW },
+                        label = { Text("Review") },
+                        modifier = Modifier.weight(1f)
                     )
                 }
-                if (!showReviews) {
+                when (mode) {
+                    ActivityMode.PROCESSING -> {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -1319,7 +1483,27 @@ fun ProcessingScreen(viewModel: BrainViewModel) {
                         LibraryStat("Done", completedCount, Icons.Default.CheckCircle, Modifier.weight(1f))
                         LibraryStat("Failed", failedCount, Icons.Default.ErrorOutline, Modifier.weight(1f))
                     }
-                } else {
+                    }
+                    ActivityMode.ACTIONS -> {
+                        val open = visibleActions.count { it.status == ActionStatus.OPEN }
+                        val completed = visibleActions.count { it.status == ActionStatus.COMPLETED }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            LibraryStat("Open", open, Icons.Default.RadioButtonUnchecked, Modifier.weight(1f))
+                            LibraryStat("Done", completed, Icons.Default.TaskAlt, Modifier.weight(1f))
+                            LibraryStat(
+                                "Due today",
+                                visibleActions.count {
+                                    it.status == ActionStatus.OPEN && actionDueDate(it) == LocalDate.now()
+                                },
+                                Icons.Default.Event,
+                                Modifier.weight(1f)
+                            )
+                        }
+                    }
+                    ActivityMode.REVIEW -> {
                     Surface(
                         color = MaterialTheme.colorScheme.primaryContainer,
                         shape = RoundedCornerShape(16.dp)
@@ -1336,11 +1520,12 @@ fun ProcessingScreen(viewModel: BrainViewModel) {
                             }
                         }
                     }
+                    }
                 }
             }
         }
 
-        if (!showReviews) item {
+        if (mode == ActivityMode.PROCESSING) item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -1360,69 +1545,126 @@ fun ProcessingScreen(viewModel: BrainViewModel) {
             }
         }
 
-        if (!showReviews && jobs.isEmpty()) {
-            item {
-                Column(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 64.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Surface(
-                        modifier = Modifier.size(72.dp),
-                        shape = CircleShape,
-                        color = MaterialTheme.colorScheme.secondaryContainer
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(Icons.Default.DoneAll, null, Modifier.size(32.dp))
+        when (mode) {
+            ActivityMode.PROCESSING -> {
+                if (jobs.isEmpty()) {
+                    item {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 64.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Surface(
+                                modifier = Modifier.size(72.dp),
+                                shape = CircleShape,
+                                color = MaterialTheme.colorScheme.secondaryContainer
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(Icons.Default.DoneAll, null, Modifier.size(32.dp))
+                                }
+                            }
+                            Spacer(Modifier.height(16.dp))
+                            Text("Everything is processed", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "New notes and recordings will appear here.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                     }
-                    Spacer(Modifier.height(16.dp))
-                    Text("Everything is processed", fontWeight = FontWeight.SemiBold)
-                    Text(
-                        "New notes and recordings will appear here.",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                } else {
+                    items(jobs, key = { it.id }) { job ->
+                        ProcessingJobCard(
+                            job = job,
+                            note = notesById[job.noteId],
+                            onRetry = { viewModel.retryProcessingJob(job) },
+                            onCancel = { viewModel.cancelProcessingJob(job) }
+                        )
+                    }
                 }
             }
-        } else if (!showReviews) {
-            items(jobs, key = { it.id }) { job ->
-                ProcessingJobCard(
-                    job = job,
-                    note = notesById[job.noteId],
-                    onRetry = { viewModel.retryProcessingJob(job) },
-                    onCancel = { viewModel.cancelProcessingJob(job) }
-                )
-            }
-        } else if (reviews.isEmpty()) {
-            item {
-                Column(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 64.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Surface(
-                        modifier = Modifier.size(72.dp),
-                        shape = CircleShape,
-                        color = MaterialTheme.colorScheme.tertiaryContainer
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(Icons.Default.Verified, null, Modifier.size(32.dp))
+            ActivityMode.ACTIONS -> {
+                if (visibleActions.isEmpty()) {
+                    item {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 64.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Surface(
+                                modifier = Modifier.size(72.dp),
+                                shape = CircleShape,
+                                color = MaterialTheme.colorScheme.secondaryContainer
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(Icons.Default.TaskAlt, null, Modifier.size(32.dp))
+                                }
+                            }
+                            Spacer(Modifier.height(16.dp))
+                            Text("No actions yet", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Write TODO, Reminder, or an unchecked checklist in a note.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
                         }
                     }
-                    Spacer(Modifier.height(16.dp))
-                    Text("Your graph is reviewed", fontWeight = FontWeight.SemiBold)
-                    Text(
-                        "Uncertain entities and relationships will appear here.",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                } else {
+                    items(visibleActions, key = { it.id }) { action ->
+                        ActionItemCard(
+                            item = action,
+                            sourceNote = notesById[action.noteId],
+                            onToggle = {
+                                viewModel.updateActionStatus(
+                                    action,
+                                    if (action.status == ActionStatus.COMPLETED) {
+                                        ActionStatus.OPEN
+                                    } else {
+                                        ActionStatus.COMPLETED
+                                    }
+                                )
+                            },
+                            onDismiss = if (action.status == ActionStatus.OPEN) {
+                                { viewModel.updateActionStatus(action, ActionStatus.DISMISSED) }
+                            } else {
+                                null
+                            }
+                        )
+                    }
                 }
             }
-        } else {
-            items(reviews, key = { it.id }) { item ->
-                KnowledgeReviewCard(
-                    item = item,
-                    note = notesById[item.noteId],
-                    onAccept = { viewModel.acceptKnowledgeReview(item) },
-                    onReject = { viewModel.rejectKnowledgeReview(item) }
-                )
+            ActivityMode.REVIEW -> {
+                if (reviews.isEmpty()) {
+                    item {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 64.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Surface(
+                                modifier = Modifier.size(72.dp),
+                                shape = CircleShape,
+                                color = MaterialTheme.colorScheme.tertiaryContainer
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(Icons.Default.Verified, null, Modifier.size(32.dp))
+                                }
+                            }
+                            Spacer(Modifier.height(16.dp))
+                            Text("Your graph is reviewed", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Uncertain entities and relationships will appear here.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    }
+                } else {
+                    items(reviews, key = { it.id }) { review ->
+                        KnowledgeReviewCard(
+                            item = review,
+                            note = notesById[review.noteId],
+                            onAccept = { viewModel.acceptKnowledgeReview(review) },
+                            onReject = { viewModel.rejectKnowledgeReview(review) }
+                        )
+                    }
+                }
             }
         }
     }
@@ -2411,6 +2653,23 @@ private fun formatRelativeDay(timestampSeconds: Double): String {
         in 2..6 -> "$days days ago"
         else -> SimpleDateFormat("d MMM yyyy", Locale.getDefault())
             .format(Date((timestampSeconds * 1_000).toLong()))
+    }
+}
+
+private fun actionDueDate(item: ActionItem): LocalDate? = item.dueTimestamp?.let {
+    Instant.ofEpochSecond(it.toLong()).atZone(ZoneId.systemDefault()).toLocalDate()
+}
+
+private fun actionDueLabel(item: ActionItem): String {
+    val due = actionDueDate(item) ?: return "No due date"
+    val today = LocalDate.now()
+    return when (due) {
+        today -> "Due today"
+        today.plusDays(1) -> "Due tomorrow"
+        else -> {
+            val prefix = if (due.isBefore(today)) "Overdue · " else "Due "
+            prefix + due.format(DateTimeFormatter.ofPattern("d MMM", Locale.getDefault()))
+        }
     }
 }
 

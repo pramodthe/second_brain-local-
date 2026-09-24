@@ -614,6 +614,110 @@ class BrainStore(private val context: Context) {
         }
     }
 
+    suspend fun syncOpenActionItems(noteId: String, proposals: List<ActionItem>): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val d = db ?: error("Database not open")
+                val existing = queryActionItems(d, noteId = noteId)
+                val existingById = existing.associateBy(ActionItem::id)
+                existing.filter { it.status == ActionStatus.OPEN }.forEach { removeAction(d, it.id) }
+                val merged = proposals.mapNotNull { proposal ->
+                    val previous = existingById[proposal.id]
+                    when (previous?.status) {
+                        ActionStatus.COMPLETED, ActionStatus.DISMISSED -> null
+                        else -> proposal.copy(
+                            createdTimestamp = previous?.createdTimestamp ?: proposal.createdTimestamp,
+                            updatedTimestamp = now()
+                        )
+                    }
+                }
+                putActionItems(d, merged)
+                Unit
+            }
+        }
+
+    suspend fun getActionItems(
+        status: ActionStatus? = null,
+        limit: Int = 1_000
+    ): Result<List<ActionItem>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            queryActionItems(d, status = status, limit = limit)
+                .sortedWith(
+                    compareBy<ActionItem> { it.dueTimestamp ?: Double.MAX_VALUE }
+                        .thenByDescending(ActionItem::updatedTimestamp)
+                )
+        }
+    }
+
+    suspend fun updateActionStatus(id: String, status: ActionStatus): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val d = db ?: error("Database not open")
+                val current = queryActionItems(d, id = id, limit = 1).firstOrNull()
+                    ?: error("Action not found")
+                putActionItems(d, listOf(current.copy(status = status, updatedTimestamp = now())))
+                Unit
+            }
+        }
+
+    suspend fun restoreActionItems(items: List<ActionItem>): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            items.forEach { incoming ->
+                val local = queryActionItems(d, id = incoming.id, limit = 1).firstOrNull()
+                if (local == null || incoming.updatedTimestamp > local.updatedTimestamp) {
+                    putActionItems(d, listOf(incoming))
+                }
+            }
+            Unit
+        }
+    }
+
+    private fun queryActionItems(
+        d: CozoDb,
+        status: ActionStatus? = null,
+        noteId: String? = null,
+        id: String? = null,
+        limit: Int = MAX_BACKUP_ITEMS
+    ): List<ActionItem> {
+        val filters = buildList {
+            status?.let { add("status == \"${it.name}\"") }
+            noteId?.let { add("note_id == \"${esc(it)}\"") }
+            id?.let { add("id == \"${esc(it)}\"") }
+        }.joinToString(separator = ", ", prefix = if (status != null || noteId != null || id != null) ", " else "")
+        return d.run(
+            """
+            ?[id, note_id, text, due_at, status, confidence, evidence, created_at, updated_at] :=
+                *action_item{id, note_id, text, due_at, status, confidence, evidence, created_at, updated_at}$filters
+            :order -updated_at
+            :limit ${limit.coerceIn(1, MAX_BACKUP_ITEMS)}
+            """.trimIndent()
+        ).map(::actionItemFromRow)
+    }
+
+    private fun putActionItems(d: CozoDb, items: List<ActionItem>) {
+        if (items.isEmpty()) return
+        val rows = items.joinToString(", ") { item ->
+            """["${esc(item.id)}", "${esc(item.noteId)}", "${esc(item.text)}", ${item.dueTimestamp ?: -1.0}, "${item.status.name}", ${item.confidence.coerceIn(0.0, 1.0)}, "${esc(item.evidence)}", ${item.createdTimestamp}, ${item.updatedTimestamp}]"""
+        }
+        d.run(
+            """
+            ?[id, note_id, text, due_at, status, confidence, evidence, created_at, updated_at] <- [$rows]
+            :put action_item {id => note_id, text, due_at, status, confidence, evidence, created_at, updated_at}
+            """.trimIndent()
+        )
+    }
+
+    private fun removeAction(d: CozoDb, id: String) {
+        d.run(
+            """
+            ?[id] <- [["${esc(id)}"]]
+            :rm action_item {id}
+            """.trimIndent()
+        )
+    }
+
     suspend fun enqueueProcessingJob(
         noteId: String,
         type: ProcessingJobType
@@ -755,6 +859,21 @@ class BrainStore(private val context: Context) {
         createdTimestamp = row.rows[8].asDouble(),
         updatedTimestamp = row.rows[9].asDouble()
     )
+
+    private fun actionItemFromRow(row: CozoDb.RelationRow): ActionItem {
+        val dueAt = row.rows[3].asDouble()
+        return ActionItem(
+            id = row.rows[0].asString(),
+            noteId = row.rows[1].asString(),
+            text = row.rows[2].asString(),
+            dueTimestamp = dueAt.takeIf { it >= 0.0 },
+            status = ActionStatus.fromString(row.rows[4].asString()),
+            confidence = row.rows[5].asDouble(),
+            evidence = row.rows[6].asString(),
+            createdTimestamp = row.rows[7].asDouble(),
+            updatedTimestamp = row.rows[8].asDouble()
+        )
+    }
 
     private fun knowledgeReviewFromRow(row: CozoDb.RelationRow): KnowledgeReviewItem = KnowledgeReviewItem(
         id = row.rows[0].asString(),
@@ -964,6 +1083,7 @@ class BrainStore(private val context: Context) {
             ":create edge_quality {source: String, relation: String, target: String => confidence: Float, status: String, evidence: String, note_id: String}",
             ":create note_entity {note_id: String, entity_name: String => at: Float}",
             ":create review_item {id: String => kind: String, status: String, note_id: String, subject: String, candidate: String, schema_type: String, description: String, aliases: String, confidence: Float, evidence: String, created_at: Float, updated_at: Float}",
+            ":create action_item {id: String => note_id: String, text: String, due_at: Float, status: String, confidence: Float, evidence: String, created_at: Float, updated_at: Float}",
             ":create note_vector {note_id: String => embedding: <F32; 256>, at: Float}",
             "::hnsw create note_vector:vec_idx {dim: 256, m: 24, ef_construction: 64, fields: [embedding], distance: Cosine}"
         )

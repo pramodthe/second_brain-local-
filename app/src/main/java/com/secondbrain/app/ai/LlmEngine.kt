@@ -14,10 +14,12 @@ import com.nexa.sdk.bean.PluginIdValue
 import com.secondbrain.app.data.EntityCategory
 import com.secondbrain.app.data.EntityNode
 import com.secondbrain.app.data.ExtractedKnowledge
+import com.secondbrain.app.data.ActionCandidate
 import com.secondbrain.app.data.RelationEdge
 import com.secondbrain.app.data.RelationType
 import com.secondbrain.app.data.RetrievedSource
 import com.secondbrain.app.data.SubgraphContext
+import com.secondbrain.app.domain.ActionExtractor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -31,6 +33,7 @@ import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.time.LocalDate
 import kotlin.coroutines.resume
 
 data class ModelInfo(
@@ -180,11 +183,14 @@ class LlmEngine(private val context: Context) {
     /**
      * Extracts ontology entities and relations from text using LLM or rule-based fallback.
      */
-    suspend fun extractOntology(text: String): ExtractedKnowledge = withContext(Dispatchers.IO) {
+    suspend fun extractOntology(
+        text: String,
+        referenceDate: LocalDate = LocalDate.now()
+    ): ExtractedKnowledge = withContext(Dispatchers.IO) {
         operationMutex.withLock {
             val engine = llm
             if (engine == null) {
-                return@withLock ruleBasedExtraction(text)
+                return@withLock ruleBasedExtraction(text, referenceDate)
             }
 
             val prompt = """
@@ -192,10 +198,13 @@ class LlmEngine(private val context: Context) {
             Entity categories: Concept, Project, Resource, Person, Decision, Insight
             Relation types: DEPENDS_ON, CONTRADICTS, EXTENDS, MENTIONS, SUPERSEDES, DERIVED_FROM, USES_CONCEPT, AUTHORED_BY, RELATED_TO
 
+            The note was captured on $referenceDate.
+
             Return ONLY valid JSON matching this format:
             {
               "entities": [{"name": "...", "category": "Concept|Project|...", "description": "...", "aliases": ["..."], "evidence": "exact quote from the note", "confidence": 0.0}],
-              "relations": [{"source": "...", "relation": "DEPENDS_ON|...", "target": "...", "evidence": "exact quote from the note", "confidence": 0.0}]
+              "relations": [{"source": "...", "relation": "DEPENDS_ON|...", "target": "...", "evidence": "exact quote from the note", "confidence": 0.0}],
+              "actions": [{"text": "...", "dueDate": "YYYY-MM-DD or null", "evidence": "exact quote from the note", "confidence": 0.0}]
             }
 
             Rules:
@@ -204,13 +213,25 @@ class LlmEngine(private val context: Context) {
             - Do not infer facts that the note does not state.
             - Use a canonical, concise entity name. Put alternate spellings or abbreviations in aliases.
             - Relation endpoints must exactly match an entity name or alias in the entities array.
+            - Actions must be explicit commitments, TODOs, requests, or reminders—not general facts or aspirations.
+            - Convert explicit relative dates such as tomorrow or next Friday to YYYY-MM-DD using the capture date shown above. Use null when no due date is stated.
 
             Text:
             $text
         """.trimIndent()
 
             val raw = generateSingleTurn(prompt).getOrDefault("")
-            parseExtractionJson(raw).ifEmptyFallback { ruleBasedExtraction(text) }
+            val parsed = parseExtractionJson(raw)
+            val fallback = ruleBasedExtraction(text, referenceDate)
+            val withGraphFallback = if (parsed.entities.isEmpty() && parsed.relations.isEmpty()) {
+                parsed.copy(entities = fallback.entities, relations = fallback.relations)
+            } else {
+                parsed
+            }
+            withGraphFallback.copy(
+                actions = (fallback.actions + withGraphFallback.actions)
+                    .distinctBy { it.text.lowercase().replace(Regex("[^a-z0-9]+"), " ").trim() }
+            )
         }
     }
 
@@ -368,12 +389,25 @@ class LlmEngine(private val context: Context) {
                 }
             }
 
-            ExtractedKnowledge(entities, relations)
-        }.getOrDefault(ExtractedKnowledge(emptyList(), emptyList()))
-    }
+            val actions = mutableListOf<ActionCandidate>()
+            obj.optJSONArray("actions")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val action = arr.getJSONObject(i)
+                    actions.add(
+                        ActionCandidate(
+                            text = action.getString("text").trim(),
+                            dueDate = action.optString("dueDate").takeIf {
+                                it.isNotBlank() && !it.equals("null", ignoreCase = true)
+                            },
+                            evidence = action.optString("evidence", ""),
+                            confidence = action.optDouble("confidence", 0.5).coerceIn(0.0, 1.0)
+                        )
+                    )
+                }
+            }
 
-    private fun ExtractedKnowledge.ifEmptyFallback(fallback: () -> ExtractedKnowledge): ExtractedKnowledge {
-        return if (entities.isEmpty() && relations.isEmpty()) fallback() else this
+            ExtractedKnowledge(entities, relations, actions)
+        }.getOrDefault(ExtractedKnowledge(emptyList(), emptyList()))
     }
 
     private fun JSONArray.toStringList(): List<String> = buildList {
@@ -385,7 +419,10 @@ class LlmEngine(private val context: Context) {
     /**
      * Fast local rule-based entity and relation extractor when LLM is uninitialized.
      */
-    fun ruleBasedExtraction(text: String): ExtractedKnowledge {
+    fun ruleBasedExtraction(
+        text: String,
+        referenceDate: LocalDate = LocalDate.now()
+    ): ExtractedKnowledge {
         val entities = mutableListOf<EntityNode>()
         val relations = mutableListOf<RelationEdge>()
 
@@ -439,7 +476,11 @@ class LlmEngine(private val context: Context) {
             }
         }
 
-        return ExtractedKnowledge(entities, relations)
+        return ExtractedKnowledge(
+            entities,
+            relations,
+            ActionExtractor.deterministicCandidates(text, referenceDate)
+        )
     }
 
     fun release() {

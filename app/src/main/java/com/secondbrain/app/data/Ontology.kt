@@ -98,7 +98,8 @@ data class NoteDocument(
 
 data class ExtractedKnowledge(
     val entities: List<EntityNode>,
-    val relations: List<RelationEdge>
+    val relations: List<RelationEdge>,
+    val actions: List<ActionCandidate> = emptyList()
 )
 
 data class RetrievedSource(

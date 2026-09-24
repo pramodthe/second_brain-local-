@@ -12,14 +12,16 @@ data class BackupPayload(
     val entities: List<EntityNode>,
     val edges: List<RelationEdge>,
     val noteEntityNames: Map<String, Set<String>>,
-    val reviews: List<KnowledgeReviewItem>
+    val reviews: List<KnowledgeReviewItem>,
+    val actions: List<ActionItem> = emptyList()
 )
 
 data class BackupReport(
     val notes: Int,
     val entities: Int,
     val edges: Int,
-    val recordings: Int
+    val recordings: Int,
+    val actions: Int = 0
 )
 
 data class RestoreReport(
@@ -27,5 +29,6 @@ data class RestoreReport(
     val skippedNewerNotes: Int,
     val entities: Int,
     val edges: Int,
-    val recordings: Int
+    val recordings: Int,
+    val actions: Int = 0
 )

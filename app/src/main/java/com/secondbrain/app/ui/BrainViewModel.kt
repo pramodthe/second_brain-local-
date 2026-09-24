@@ -13,6 +13,8 @@ import com.secondbrain.app.ai.SpeechEngine
 import com.secondbrain.app.ai.VoiceRecorder
 import com.secondbrain.app.backup.BackupManager
 import com.secondbrain.app.data.BrainStore
+import com.secondbrain.app.data.ActionItem
+import com.secondbrain.app.data.ActionStatus
 import com.secondbrain.app.data.EntityNode
 import com.secondbrain.app.data.KnowledgeReviewItem
 import com.secondbrain.app.data.NoteDocument
@@ -109,6 +111,9 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _knowledgeReviews = MutableStateFlow<List<KnowledgeReviewItem>>(emptyList())
     val knowledgeReviews: StateFlow<List<KnowledgeReviewItem>> = _knowledgeReviews.asStateFlow()
+
+    private val _actionItems = MutableStateFlow<List<ActionItem>>(emptyList())
+    val actionItems: StateFlow<List<ActionItem>> = _actionItems.asStateFlow()
 
     private val _isRecording = MutableStateFlow(false)
     val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
@@ -218,7 +223,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val report = backupManager.export(uri, passphrase.toCharArray(), includeRecordings)
                 _backupState.value = BackupUiState(
-                    message = "Backup saved · ${report.notes} notes, ${report.entities} ideas, ${report.recordings} recordings",
+                    message = "Backup saved · ${report.notes} notes, ${report.actions} actions, ${report.recordings} recordings",
                     completedOperation = System.currentTimeMillis()
                 )
             } catch (error: Exception) {
@@ -235,7 +240,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
                 val report = backupManager.restore(uri, passphrase.toCharArray())
                 loadData()
                 _backupState.value = BackupUiState(
-                    message = "Restore complete · ${report.importedNotes} imported, " +
+                    message = "Restore complete · ${report.importedNotes} notes imported, ${report.actions} actions merged, " +
                         "${report.skippedNewerNotes} unchanged or newer local notes kept",
                     completedOperation = System.currentTimeMillis()
                 )
@@ -254,6 +259,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
         _entities.value = store.getAllEntities().getOrDefault(emptyList())
         _edges.value = store.getAllEdges().getOrDefault(emptyList())
         _knowledgeReviews.value = store.getKnowledgeReviews().getOrDefault(emptyList())
+        _actionItems.value = store.getActionItems().getOrDefault(emptyList())
         _stats.value = store.getStats()
     }
 
@@ -476,6 +482,16 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
     fun clearResolvedKnowledgeReviews() {
         viewModelScope.launch {
             store.removeResolvedKnowledgeReviews()
+            loadData()
+        }
+    }
+
+    fun updateActionStatus(item: ActionItem, status: ActionStatus) {
+        viewModelScope.launch {
+            store.updateActionStatus(item.id, status)
+                .onFailure { error ->
+                    _appError.value = "Could not update the action: ${error.message ?: "unknown error"}"
+                }
             loadData()
         }
     }

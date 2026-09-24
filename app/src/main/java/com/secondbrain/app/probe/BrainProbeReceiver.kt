@@ -7,6 +7,8 @@ import android.util.Log
 import com.secondbrain.app.ai.EmbedderEngine
 import com.secondbrain.app.ai.LlmEngine
 import com.secondbrain.app.ai.SpeechEngine
+import com.secondbrain.app.data.ActionItem
+import com.secondbrain.app.data.ActionStatus
 import com.secondbrain.app.data.BrainStore
 import com.secondbrain.app.data.ProcessingJobType
 import com.secondbrain.app.domain.HybridRetriever
@@ -32,6 +34,8 @@ class BrainProbeReceiver : BroadcastReceiver() {
                     runQueueDiagnostic(context.applicationContext)
                 } else if (intent?.getBooleanExtra(EXTRA_RETRIEVAL_ONLY, false) == true) {
                     runRetrievalDiagnostic(context.applicationContext)
+                } else if (intent?.getBooleanExtra(EXTRA_ACTIONS_ONLY, false) == true) {
+                    runActionsDiagnostic(context.applicationContext)
                 } else {
                     runDiagnostic(context.applicationContext)
                 }
@@ -41,6 +45,45 @@ class BrainProbeReceiver : BroadcastReceiver() {
                 pending.finish()
             }
         }
+    }
+
+    private suspend fun runActionsDiagnostic(context: Context) {
+        Log.i(TAG, "================== START ACTIONS PROBE ==================")
+        val store = BrainStore(context)
+        val probe = ActionItem(
+            id = ActionItem.stableId(ACTION_PROBE_NOTE_ID, "Verify action storage tomorrow"),
+            noteId = ACTION_PROBE_NOTE_ID,
+            text = "Verify action storage tomorrow",
+            dueTimestamp = System.currentTimeMillis() / 1_000.0 + 86_400,
+            confidence = 0.99,
+            evidence = "TODO: Verify action storage tomorrow"
+        )
+        try {
+            store.open().getOrThrow()
+            store.syncOpenActionItems(ACTION_PROBE_NOTE_ID, listOf(probe)).getOrThrow()
+            val inserted = store.getActionItems(limit = 100_000).getOrThrow()
+                .firstOrNull { it.id == probe.id }
+            check(inserted?.status == ActionStatus.OPEN) { "Open action was not persisted" }
+
+            store.updateActionStatus(probe.id, ActionStatus.COMPLETED).getOrThrow()
+            val completed = store.getActionItems(limit = 100_000).getOrThrow()
+                .firstOrNull { it.id == probe.id }
+            check(completed?.status == ActionStatus.COMPLETED) { "Action status was not updated" }
+
+            store.updateActionStatus(probe.id, ActionStatus.OPEN).getOrThrow()
+            store.syncOpenActionItems(ACTION_PROBE_NOTE_ID, emptyList()).getOrThrow()
+            check(store.getActionItems(limit = 100_000).getOrThrow().none { it.id == probe.id }) {
+                "Probe action was not cleaned up"
+            }
+            Log.i(TAG, "ACTIONS PASS: insert, query, complete, reopen, and cleanup succeeded")
+        } catch (error: Throwable) {
+            Log.e(TAG, "ACTIONS FAIL: ${error.message}", error)
+        } finally {
+            runCatching { store.updateActionStatus(probe.id, ActionStatus.OPEN).getOrThrow() }
+            runCatching { store.syncOpenActionItems(ACTION_PROBE_NOTE_ID, emptyList()).getOrThrow() }
+            store.close()
+        }
+        Log.i(TAG, "================== ACTIONS PROBE COMPLETE ==================")
     }
 
     private suspend fun runRetrievalDiagnostic(context: Context) {
@@ -209,5 +252,7 @@ class BrainProbeReceiver : BroadcastReceiver() {
         private const val EXTRA_SPEECH_ONLY = "speech_only"
         private const val EXTRA_QUEUE_ONLY = "queue_only"
         private const val EXTRA_RETRIEVAL_ONLY = "retrieval_only"
+        private const val EXTRA_ACTIONS_ONLY = "actions_only"
+        private const val ACTION_PROBE_NOTE_ID = "probe-action-storage"
     }
 }
