@@ -38,7 +38,7 @@ class IngestionPipeline(
             val capturedAt = System.currentTimeMillis() / 1000.0
             val note = NoteDocument(
                 id = "n-${UUID.randomUUID()}",
-                title = title.trim(),
+                title = title.trim().ifBlank { NoteTitleGenerator.fromContent(content) },
                 content = content,
                 timestamp = capturedAt,
                 source = source,
@@ -60,7 +60,7 @@ class IngestionPipeline(
     ): Result<NoteDocument> = withContext(Dispatchers.IO) {
         runCatching {
             val updated = existing.copy(
-                title = title.trim(),
+                title = title.trim().ifBlank { NoteTitleGenerator.fromContent(content) },
                 content = content,
                 modifiedTimestamp = System.currentTimeMillis() / 1000.0
             )

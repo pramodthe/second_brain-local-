@@ -14,6 +14,7 @@ import com.secondbrain.app.data.ProcessingJobStatus
 import com.secondbrain.app.data.ProcessingJobType
 import com.secondbrain.app.data.TranscriptionStatus
 import com.secondbrain.app.domain.IngestionPipeline
+import com.secondbrain.app.domain.NoteTitleGenerator
 import kotlinx.coroutines.CancellationException
 import java.io.File
 
@@ -139,6 +140,7 @@ class BrainProcessingWorker(
         ensureNotCancelled(store, job.id)
 
         val completed = note.copy(
+            title = note.title.ifBlank { NoteTitleGenerator.fromContent(transcript.text) },
             content = transcript.text,
             audioDurationMs = transcript.audioDurationMs.takeIf { it > 0L } ?: note.audioDurationMs,
             transcriptionStatus = TranscriptionStatus.COMPLETE

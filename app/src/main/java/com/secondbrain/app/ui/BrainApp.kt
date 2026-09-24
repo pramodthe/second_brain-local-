@@ -19,9 +19,11 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.LibraryBooks
 import androidx.compose.material.icons.automirrored.filled.ManageSearch
+import androidx.compose.material.icons.automirrored.filled.Notes
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.FactCheck
 import androidx.compose.material.icons.filled.*
@@ -54,10 +56,16 @@ import com.secondbrain.app.data.TranscriptionStatus
 import androidx.core.content.ContextCompat
 import java.text.DateFormat
 import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.temporal.ChronoUnit
 import java.util.Date
 import java.util.Locale
 
 enum class BrainTab(val label: String) {
+    TODAY("Today"),
     NOTES("Notes"),
     EXPLORE("Explore"),
     PROCESSING("Tasks"),
@@ -65,13 +73,22 @@ enum class BrainTab(val label: String) {
     OWNERSHIP("Own")
 }
 
+private val primaryTabs = listOf(
+    BrainTab.TODAY,
+    BrainTab.NOTES,
+    BrainTab.EXPLORE,
+    BrainTab.ASK,
+    BrainTab.OWNERSHIP
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BrainApp(viewModel: BrainViewModel) {
-    var selectedTab by rememberSaveable { mutableStateOf(BrainTab.NOTES) }
+    var selectedTab by rememberSaveable { mutableStateOf(BrainTab.TODAY) }
     var showComposer by rememberSaveable { mutableStateOf(false) }
     var editingNote by remember { mutableStateOf<NoteDocument?>(null) }
     val appError by viewModel.appError.collectAsState()
+    val isRecording by viewModel.isRecording.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
 
     LaunchedEffect(appError) {
@@ -89,6 +106,7 @@ fun BrainApp(viewModel: BrainViewModel) {
                     Column {
                         Text(
                             text = when (selectedTab) {
+                                BrainTab.TODAY -> "Today"
                                 BrainTab.NOTES -> "Second Brain"
                                 BrainTab.EXPLORE -> "Explore connections"
                                 BrainTab.PROCESSING -> "Tasks & review"
@@ -99,6 +117,7 @@ fun BrainApp(viewModel: BrainViewModel) {
                         )
                         Text(
                             text = when (selectedTab) {
+                                BrainTab.TODAY -> "Capture now, organize in the background"
                                 BrainTab.NOTES -> "Your private knowledge library"
                                 BrainTab.EXPLORE -> "See how your ideas connect"
                                 BrainTab.PROCESSING -> "Processing you can trust and verify"
@@ -110,6 +129,13 @@ fun BrainApp(viewModel: BrainViewModel) {
                         )
                     }
                 },
+                navigationIcon = {
+                    if (selectedTab == BrainTab.PROCESSING) {
+                        IconButton(onClick = { selectedTab = BrainTab.TODAY }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back to Today")
+                        }
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.background
                 )
@@ -117,13 +143,15 @@ fun BrainApp(viewModel: BrainViewModel) {
         },
         bottomBar = {
             NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
-                BrainTab.entries.forEach { tab ->
+                primaryTabs.forEach { tab ->
                     NavigationBarItem(
                         selected = selectedTab == tab,
                         onClick = { selectedTab = tab },
+                        enabled = !isRecording || selectedTab == tab,
                         icon = {
                             Icon(
                                 imageVector = when (tab) {
+                                    BrainTab.TODAY -> Icons.Default.Today
                                     BrainTab.NOTES -> Icons.Default.Description
                                     BrainTab.EXPLORE -> Icons.Default.Hub
                                     BrainTab.PROCESSING -> Icons.Default.PendingActions
@@ -157,6 +185,19 @@ fun BrainApp(viewModel: BrainViewModel) {
                 .padding(padding)
         ) {
             when (selectedTab) {
+                BrainTab.TODAY -> TodayScreen(
+                    viewModel = viewModel,
+                    onNewNote = {
+                        editingNote = null
+                        showComposer = true
+                    },
+                    onEditNote = { note ->
+                        editingNote = note
+                        showComposer = true
+                    },
+                    onOpenNotes = { selectedTab = BrainTab.NOTES },
+                    onOpenProcessing = { selectedTab = BrainTab.PROCESSING }
+                )
                 BrainTab.NOTES -> NotesScreen(
                     viewModel = viewModel,
                     onNewNote = {
@@ -185,6 +226,377 @@ fun BrainApp(viewModel: BrainViewModel) {
                 editingNote = null
             }
         )
+    }
+}
+
+@Composable
+fun TodayScreen(
+    viewModel: BrainViewModel,
+    onNewNote: () -> Unit,
+    onEditNote: (NoteDocument) -> Unit,
+    onOpenNotes: () -> Unit,
+    onOpenProcessing: () -> Unit
+) {
+    val notes by viewModel.notes.collectAsState()
+    val jobs by viewModel.processingJobs.collectAsState()
+    val reviews by viewModel.knowledgeReviews.collectAsState()
+    val isIngesting by viewModel.isIngesting.collectAsState()
+    val isRecording by viewModel.isRecording.collectAsState()
+    val recordingElapsedMs by viewModel.recordingElapsedMs.collectAsState()
+    val isVoiceCaptureBusy by viewModel.isVoiceCaptureBusy.collectAsState()
+    val context = LocalContext.current
+    var quickText by rememberSaveable { mutableStateOf("") }
+    var captureMessage by remember { mutableStateOf<String?>(null) }
+
+    val microphonePermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) viewModel.startVoiceRecording()
+        else viewModel.reportAppError("Microphone permission is required to record a voice note.")
+    }
+
+    val startOfToday = remember(notes) { startOfTodaySeconds() }
+    val todaysNotes = remember(notes, startOfToday) {
+        notes.filter { it.timestamp >= startOfToday }
+    }
+    val activeJobs = remember(jobs) { jobs.count { it.status.isActive } }
+    val failedJobs = remember(jobs) { jobs.count { it.status == ProcessingJobStatus.FAILED } }
+    val memoryToResurface = remember(notes, startOfToday) {
+        val older = notes.filter { it.timestamp < startOfToday }
+        older.takeIf { it.isNotEmpty() }?.let {
+            it[LocalDate.now().dayOfYear % it.size]
+        }
+    }
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 104.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item {
+            Column {
+                Text(
+                    todayGreeting(),
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    SimpleDateFormat("EEEE, d MMMM", Locale.getDefault()).format(Date()),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                shape = RoundedCornerShape(22.dp)
+            ) {
+                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Bolt, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(9.dp))
+                        Column {
+                            Text("Quick capture", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "No title or filing required. Save the thought first.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                        }
+                    }
+
+                    if (isRecording) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(14.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.GraphicEq, null, tint = MaterialTheme.colorScheme.error)
+                                Spacer(Modifier.width(10.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text("Recording ${formatDuration(recordingElapsedMs)}", fontWeight = FontWeight.SemiBold)
+                                    Text("Tap stop when the thought is complete", style = MaterialTheme.typography.bodySmall)
+                                }
+                                FilledIconButton(
+                                    onClick = {
+                                        viewModel.stopVoiceRecording("") {
+                                            captureMessage = "Voice note saved. Transcription is running locally."
+                                        }
+                                    },
+                                    enabled = !isVoiceCaptureBusy,
+                                    colors = IconButtonDefaults.filledIconButtonColors(
+                                        containerColor = MaterialTheme.colorScheme.error
+                                    )
+                                ) {
+                                    if (isVoiceCaptureBusy) {
+                                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                                    } else {
+                                        Icon(Icons.Default.Stop, contentDescription = "Stop and save recording")
+                                    }
+                                }
+                                IconButton(
+                                    onClick = viewModel::cancelVoiceRecording,
+                                    enabled = !isVoiceCaptureBusy
+                                ) {
+                                    Icon(Icons.Default.DeleteOutline, contentDescription = "Discard recording")
+                                }
+                            }
+                        }
+                    } else {
+                        OutlinedTextField(
+                            value = quickText,
+                            onValueChange = {
+                                quickText = it
+                                captureMessage = null
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            placeholder = { Text("What's on your mind?") },
+                            minLines = 3,
+                            maxLines = 7,
+                            shape = RoundedCornerShape(16.dp),
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default)
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = {
+                                    val captured = quickText
+                                    viewModel.saveNote("", captured) {
+                                        quickText = ""
+                                        captureMessage = "Saved now · organization continues in the background."
+                                    }
+                                },
+                                enabled = quickText.isNotBlank() && !isIngesting && !isVoiceCaptureBusy,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                if (isIngesting) {
+                                    CircularProgressIndicator(
+                                        Modifier.size(18.dp),
+                                        strokeWidth = 2.dp,
+                                        color = MaterialTheme.colorScheme.onPrimary
+                                    )
+                                } else {
+                                    Icon(Icons.Default.Add, null)
+                                }
+                                Spacer(Modifier.width(7.dp))
+                                Text(if (isIngesting) "Saving…" else "Save thought")
+                            }
+                            FilledTonalIconButton(
+                                onClick = {
+                                    captureMessage = null
+                                    if (
+                                        ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                                        PackageManager.PERMISSION_GRANTED
+                                    ) {
+                                        viewModel.startVoiceRecording()
+                                    } else {
+                                        microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+                                    }
+                                },
+                                enabled = !isIngesting && !isVoiceCaptureBusy
+                            ) {
+                                Icon(Icons.Default.Mic, contentDescription = "Record a voice note")
+                            }
+                        }
+                    }
+
+                    captureMessage?.let {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.CheckCircle, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(7.dp))
+                            Text(it, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                    TextButton(onClick = onNewNote, enabled = !isRecording && !isVoiceCaptureBusy) {
+                        Icon(Icons.Default.OpenInFull, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(7.dp))
+                        Text("Open full editor")
+                    }
+                }
+            }
+        }
+
+        item {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                TodayMetric("Captured", todaysNotes.size, Icons.Default.EditNote, Modifier.weight(1f))
+                TodayMetric("Working", activeJobs, Icons.Default.Sync, Modifier.weight(1f))
+                TodayMetric("Attention", reviews.size + failedJobs, Icons.AutoMirrored.Filled.FactCheck, Modifier.weight(1f))
+            }
+        }
+
+        item {
+            Card(
+                onClick = onOpenProcessing,
+                enabled = !isRecording,
+                colors = CardDefaults.cardColors(
+                    containerColor = if (failedJobs > 0) MaterialTheme.colorScheme.errorContainer
+                    else MaterialTheme.colorScheme.secondaryContainer
+                ),
+                shape = RoundedCornerShape(18.dp)
+            ) {
+                Row(
+                    Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        when {
+                            failedJobs > 0 -> Icons.Default.ErrorOutline
+                            activeJobs > 0 || reviews.isNotEmpty() -> Icons.Default.AutoAwesome
+                            else -> Icons.Default.CheckCircle
+                        },
+                        contentDescription = null
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            when {
+                                failedJobs > 0 -> "$failedJobs ${if (failedJobs == 1) "task needs" else "tasks need"} attention"
+                                activeJobs > 0 -> "Your brain is organizing $activeJobs ${if (activeJobs == 1) "note" else "notes"}"
+                                reviews.isNotEmpty() -> "${reviews.size} knowledge ${if (reviews.size == 1) "suggestion" else "suggestions"} to review"
+                                else -> "Processing and review are caught up"
+                            },
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            if (activeJobs > 0 || failedJobs > 0 || reviews.isNotEmpty()) {
+                                "Tap to inspect progress and knowledge suggestions"
+                            } else {
+                                "View completed activity and review history"
+                            },
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null)
+                }
+            }
+        }
+
+        item {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("Captured today", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (todaysNotes.isEmpty()) "Your day is ready for its first thought"
+                        else "${todaysNotes.size} ${if (todaysNotes.size == 1) "memory" else "memories"}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                TextButton(onClick = onOpenNotes, enabled = !isRecording) { Text("All notes") }
+            }
+        }
+
+        if (todaysNotes.isEmpty()) {
+            item {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(18.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerLow
+                ) {
+                    Row(Modifier.padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.WbSunny, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(12.dp))
+                        Text("Write or record anything above. The date and time are added automatically.")
+                    }
+                }
+            }
+        } else {
+            items(todaysNotes.take(4), key = { "today-${it.id}" }) { note ->
+                TodayMemoryRow(note = note, enabled = !isRecording, onClick = { onEditNote(note) })
+            }
+        }
+
+        memoryToResurface?.let { memory ->
+            item {
+                Text("From your memory", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            }
+            item {
+                Card(
+                    onClick = { onEditNote(memory) },
+                    enabled = !isRecording,
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
+                    shape = RoundedCornerShape(18.dp)
+                ) {
+                    Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.History, null)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(noteDisplayTitle(memory), fontWeight = FontWeight.SemiBold, maxLines = 1)
+                            Text(
+                                "Saved ${formatRelativeDay(memory.timestamp)} · ${notePreviewText(memory)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TodayMetric(
+    label: String,
+    value: Int,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    modifier: Modifier = Modifier
+) {
+    Surface(modifier = modifier, shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 14.dp)) {
+            Icon(icon, null, Modifier.size(19.dp), tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.height(8.dp))
+            Text(value.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+private fun TodayMemoryRow(note: NoteDocument, enabled: Boolean, onClick: () -> Unit) {
+    Card(
+        onClick = onClick,
+        enabled = enabled,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
+        shape = RoundedCornerShape(18.dp)
+    ) {
+        Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Surface(shape = CircleShape, color = MaterialTheme.colorScheme.secondaryContainer) {
+                Icon(
+                    if (note.audioPath != null) Icons.Default.GraphicEq else Icons.AutoMirrored.Filled.Notes,
+                    null,
+                    Modifier.padding(10.dp).size(20.dp)
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(noteDisplayTitle(note), fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    notePreviewText(note),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            Text(
+                SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date((note.timestamp * 1_000).toLong())),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline
+            )
+        }
     }
 }
 
@@ -1977,6 +2389,29 @@ private fun formatDuration(milliseconds: Long): String {
 private fun formatNoteDateTime(timestampSeconds: Double): String {
     val milliseconds = (timestampSeconds * 1_000).toLong()
     return DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(milliseconds))
+}
+
+private fun startOfTodaySeconds(): Double =
+    LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toEpochSecond().toDouble()
+
+private fun todayGreeting(): String = when (LocalTime.now().hour) {
+    in 5..11 -> "Good morning"
+    in 12..16 -> "Good afternoon"
+    in 17..21 -> "Good evening"
+    else -> "A quiet moment to think"
+}
+
+private fun formatRelativeDay(timestampSeconds: Double): String {
+    val savedDate = Instant.ofEpochSecond(timestampSeconds.toLong())
+        .atZone(ZoneId.systemDefault())
+        .toLocalDate()
+    val days = ChronoUnit.DAYS.between(savedDate, LocalDate.now()).toInt().coerceAtLeast(1)
+    return when (days) {
+        1 -> "yesterday"
+        in 2..6 -> "$days days ago"
+        else -> SimpleDateFormat("d MMM yyyy", Locale.getDefault())
+            .format(Date((timestampSeconds * 1_000).toLong()))
+    }
 }
 
 private fun timelineDayLabel(note: NoteDocument): String =

@@ -6,6 +6,7 @@ An offline-first Android knowledge workspace that turns notes and shared text in
 
 ## Highlights
 
+- Start from a daily workspace with one-tap text or voice capture, automatic titles, and resurfaced memories.
 - Capture notes in the app or share plain text from another Android app.
 - Record voice notes, preserve the original audio, play it back, and transcribe it fully offline.
 - Save raw notes immediately, edit them later, and retain created/modified timestamps.
@@ -47,6 +48,7 @@ Capture is intentionally durable-first. Original text or audio is written to pri
 - **Phase 4 — Knowledge quality (complete):** aliases, duplicate resolution, evidence, confidence, and review workflows.
 - **Phase 5 — Retrieval (complete):** hybrid-ranked search, related notes, timelines, and source-grounded answers.
 - **Phase 6 — Ownership (complete):** encrypted export, safe merge restore, privacy controls, and production hardening.
+- **Phase 7 — Daily brain (in progress):** Today workspace, zero-friction capture, automatic titles, memory resurfacing, and daily action views.
 
 ## Requirements
 
@@ -58,6 +60,12 @@ Capture is intentionally durable-first. Original text or audio is written to pri
 - Microphone permission when recording a voice note.
 
 The app is packaged only for `arm64-v8a`, because its on-device dependencies include native libraries.
+
+## Daily capture
+
+The app opens on **Today**, not the database or graph. Type directly into Quick capture and save without choosing a title, category, or folder; the original note and timestamp are persisted immediately, and a concise title is derived locally from its first meaningful line. Ontology extraction and embeddings continue through the background queue.
+
+The microphone button starts a voice note from the same card. Stopping preserves the original recording first, then queues offline transcription. When the transcript arrives, an untitled voice note receives a local title derived from the transcript. Today also surfaces current processing or review work, the day's recent memories, and one older memory without modifying it.
 
 ## Build and run
 
