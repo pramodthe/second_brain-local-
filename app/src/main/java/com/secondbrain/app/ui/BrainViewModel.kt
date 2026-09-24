@@ -2,6 +2,7 @@ package com.secondbrain.app.ui
 
 import android.app.Application
 import android.media.MediaPlayer
+import android.net.Uri
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -10,6 +11,7 @@ import com.secondbrain.app.ai.EmbedderEngine
 import com.secondbrain.app.ai.LlmEngine
 import com.secondbrain.app.ai.SpeechEngine
 import com.secondbrain.app.ai.VoiceRecorder
+import com.secondbrain.app.backup.BackupManager
 import com.secondbrain.app.data.BrainStore
 import com.secondbrain.app.data.EntityNode
 import com.secondbrain.app.data.KnowledgeReviewItem
@@ -39,6 +41,13 @@ data class ChatMessageItem(
     val isStreaming: Boolean = false
 )
 
+data class BackupUiState(
+    val isBusy: Boolean = false,
+    val message: String? = null,
+    val error: String? = null,
+    val completedOperation: Long = 0L
+)
+
 class BrainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val voiceRecorder = VoiceRecorder(application)
@@ -54,6 +63,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
 
     val pipeline = IngestionPipeline(store, embedder, llm)
     val retriever = HybridRetriever(store, embedder)
+    private val backupManager = BackupManager(application, store, embedder)
 
     private val _notes = MutableStateFlow<List<NoteDocument>>(emptyList())
     val notes: StateFlow<List<NoteDocument>> = _notes.asStateFlow()
@@ -123,6 +133,9 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _appError = MutableStateFlow<String?>(null)
     val appError: StateFlow<String?> = _appError.asStateFlow()
+
+    private val _backupState = MutableStateFlow(BackupUiState())
+    val backupState: StateFlow<BackupUiState> = _backupState.asStateFlow()
 
     private val _modelReady = MutableStateFlow(llm.isModelReady())
     val modelReady: StateFlow<Boolean> = _modelReady.asStateFlow()
@@ -196,6 +209,44 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
         _relatedToNote.value = null
         _relatedNotes.value = emptyList()
         _isLoadingRelatedNotes.value = false
+    }
+
+    fun exportBackup(uri: Uri, passphrase: String, includeRecordings: Boolean) {
+        if (_backupState.value.isBusy) return
+        viewModelScope.launch {
+            _backupState.value = BackupUiState(isBusy = true, message = "Encrypting your backup…")
+            try {
+                val report = backupManager.export(uri, passphrase.toCharArray(), includeRecordings)
+                _backupState.value = BackupUiState(
+                    message = "Backup saved · ${report.notes} notes, ${report.entities} ideas, ${report.recordings} recordings",
+                    completedOperation = System.currentTimeMillis()
+                )
+            } catch (error: Exception) {
+                _backupState.value = BackupUiState(error = error.message ?: "Could not create the backup")
+            }
+        }
+    }
+
+    fun restoreBackup(uri: Uri, passphrase: String) {
+        if (_backupState.value.isBusy) return
+        viewModelScope.launch {
+            _backupState.value = BackupUiState(isBusy = true, message = "Decrypting and merging your backup…")
+            try {
+                val report = backupManager.restore(uri, passphrase.toCharArray())
+                loadData()
+                _backupState.value = BackupUiState(
+                    message = "Restore complete · ${report.importedNotes} imported, " +
+                        "${report.skippedNewerNotes} unchanged or newer local notes kept",
+                    completedOperation = System.currentTimeMillis()
+                )
+            } catch (error: Exception) {
+                _backupState.value = BackupUiState(error = error.message ?: "Could not restore the backup")
+            }
+        }
+    }
+
+    fun clearBackupStatus() {
+        if (!_backupState.value.isBusy) _backupState.value = BackupUiState()
     }
 
     private suspend fun loadData() {

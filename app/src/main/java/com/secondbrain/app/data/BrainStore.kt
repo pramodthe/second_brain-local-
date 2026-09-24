@@ -433,6 +433,27 @@ class BrainStore(private val context: Context) {
         }
     }
 
+    suspend fun getAllNotes(): Result<List<NoteDocument>> = getRecentNotes(limit = 100_000)
+
+    /** Merges portable graph records without deleting any local rows. */
+    suspend fun restoreGraph(
+        entities: List<EntityNode>,
+        edges: List<RelationEdge>,
+        noteEntityNames: Map<String, Set<String>>
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            entities.forEach { entity ->
+                putEntityRecord(d, entity, entity.sourceNoteId)
+            }
+            edges.forEach { edge -> putEdge(d, edge) }
+            noteEntityNames.forEach { (noteId, names) ->
+                names.forEach { name -> linkNoteEntity(d, noteId, name) }
+            }
+            Unit
+        }
+    }
+
     suspend fun getNote(noteId: String): Result<NoteDocument?> = withContext(Dispatchers.IO) {
         runCatching {
             val d = db ?: error("Database not open")
@@ -501,11 +522,14 @@ class BrainStore(private val context: Context) {
                 ?[id, kind, status, note_id, subject, candidate, schema_type, description, aliases, confidence, evidence, created_at, updated_at] :=
                     *review_item{id, kind, status, note_id, subject, candidate, schema_type, description, aliases, confidence, evidence, created_at, updated_at}$statusFilter
                 :order -updated_at
-                :limit ${limit.coerceIn(1, 500)}
+                :limit ${limit.coerceIn(1, MAX_BACKUP_ITEMS)}
                 """.trimIndent()
             ).map(::knowledgeReviewFromRow)
         }
     }
+
+    suspend fun getAllKnowledgeReviews(): Result<List<KnowledgeReviewItem>> =
+        getKnowledgeReviews(status = null, limit = MAX_BACKUP_ITEMS)
 
     suspend fun removePendingKnowledgeReviews(noteId: String): Result<Int> = withContext(Dispatchers.IO) {
         runCatching {
@@ -752,6 +776,11 @@ class BrainStore(private val context: Context) {
     )
 
     private fun putEntity(d: CozoDb, entity: EntityNode, noteId: String) {
+        putEntityRecord(d, entity, noteId)
+        linkNoteEntity(d, noteId, entity.name)
+    }
+
+    private fun putEntityRecord(d: CozoDb, entity: EntityNode, noteId: String) {
         d.run(
             """
             ?[name, category, description, at] <- [["${esc(entity.name)}", "${entity.category.name}", "${esc(entity.description)}", ${entity.timestamp}]]
@@ -765,7 +794,6 @@ class BrainStore(private val context: Context) {
             """.trimIndent()
         )
         putAliases(d, entity.name, entity.aliases, entity.confidence, noteId)
-        linkNoteEntity(d, noteId, entity.name)
     }
 
     private fun putEdge(d: CozoDb, edge: RelationEdge) {
@@ -921,6 +949,7 @@ class BrainStore(private val context: Context) {
 
     companion object {
         private const val TAG = "BrainStore"
+        private const val MAX_BACKUP_ITEMS = 100_000
         const val EMBEDDING_DIM = 256
 
         private val SCHEMA = listOf(

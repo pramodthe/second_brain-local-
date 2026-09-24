@@ -35,6 +35,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -59,7 +61,8 @@ enum class BrainTab(val label: String) {
     NOTES("Notes"),
     EXPLORE("Explore"),
     PROCESSING("Tasks"),
-    ASK("Ask")
+    ASK("Ask"),
+    OWNERSHIP("Own")
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -90,6 +93,7 @@ fun BrainApp(viewModel: BrainViewModel) {
                                 BrainTab.EXPLORE -> "Explore connections"
                                 BrainTab.PROCESSING -> "Tasks & review"
                                 BrainTab.ASK -> "Ask your notes"
+                                BrainTab.OWNERSHIP -> "Own your data"
                             },
                             fontWeight = FontWeight.SemiBold
                         )
@@ -99,6 +103,7 @@ fun BrainApp(viewModel: BrainViewModel) {
                                 BrainTab.EXPLORE -> "See how your ideas connect"
                                 BrainTab.PROCESSING -> "Processing you can trust and verify"
                                 BrainTab.ASK -> "Answers grounded in your knowledge"
+                                BrainTab.OWNERSHIP -> "Encrypted backup, restore, and privacy"
                             },
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -123,6 +128,7 @@ fun BrainApp(viewModel: BrainViewModel) {
                                     BrainTab.EXPLORE -> Icons.Default.Hub
                                     BrainTab.PROCESSING -> Icons.Default.PendingActions
                                     BrainTab.ASK -> Icons.Default.AutoAwesome
+                                    BrainTab.OWNERSHIP -> Icons.Default.Security
                                 },
                                 contentDescription = tab.label
                             )
@@ -165,6 +171,7 @@ fun BrainApp(viewModel: BrainViewModel) {
                 BrainTab.EXPLORE -> GraphScreen(viewModel)
                 BrainTab.PROCESSING -> ProcessingScreen(viewModel)
                 BrainTab.ASK -> ChatScreen(viewModel)
+                BrainTab.OWNERSHIP -> OwnershipScreen(viewModel)
             }
         }
     }
@@ -1414,6 +1421,230 @@ fun categoryColor(category: EntityCategory): Color = when (category) {
 }
 
 internal fun normalizeGraphName(value: String): String = value.lowercase().filter { it.isLetterOrDigit() }
+
+@Composable
+fun OwnershipScreen(viewModel: BrainViewModel) {
+    val backupState by viewModel.backupState.collectAsState()
+    // Credentials deliberately stay out of Android saved-instance state.
+    var passphrase by remember { mutableStateOf("") }
+    var confirmation by remember { mutableStateOf("") }
+    var includeRecordings by rememberSaveable { mutableStateOf(true) }
+    var showPassphrase by rememberSaveable { mutableStateOf(false) }
+    var localError by rememberSaveable { mutableStateOf<String?>(null) }
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        uri?.let { viewModel.exportBackup(it, passphrase, includeRecordings) }
+    }
+    val restoreLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri?.let { viewModel.restoreBackup(it, passphrase) }
+    }
+
+    LaunchedEffect(backupState.completedOperation) {
+        if (backupState.completedOperation > 0L) {
+            passphrase = ""
+            confirmation = ""
+        }
+    }
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 104.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = MaterialTheme.colorScheme.primaryContainer
+            ) {
+                Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Lock, null, Modifier.size(32.dp))
+                    Spacer(Modifier.width(14.dp))
+                    Column {
+                        Text("Your memories, in your hands", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Backups use AES-256-GCM encryption before leaving the app.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+        }
+
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
+                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("Backup passphrase", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "This is never saved or uploaded. If you forget it, the backup cannot be recovered.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = passphrase,
+                        onValueChange = {
+                            passphrase = it
+                            localError = null
+                            viewModel.clearBackupStatus()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Passphrase") },
+                        singleLine = true,
+                        visualTransformation = if (showPassphrase) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { showPassphrase = !showPassphrase }) {
+                                Icon(
+                                    if (showPassphrase) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                    contentDescription = if (showPassphrase) "Hide passphrase" else "Show passphrase"
+                                )
+                            }
+                        }
+                    )
+                    OutlinedTextField(
+                        value = confirmation,
+                        onValueChange = {
+                            confirmation = it
+                            localError = null
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Confirm for export") },
+                        supportingText = { Text("Required only when creating a new backup") },
+                        singleLine = true,
+                        visualTransformation = if (showPassphrase) VisualTransformation.None else PasswordVisualTransformation()
+                    )
+                    localError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                }
+            }
+        }
+
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
+                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Archive, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("Create encrypted backup", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Notes, graph, evidence, aliases, and review history",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Include voice recordings")
+                            Text(
+                                "Model files are never included.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(checked = includeRecordings, onCheckedChange = { includeRecordings = it })
+                    }
+                    Button(
+                        onClick = {
+                            when {
+                                passphrase.length < 8 -> localError = "Use at least 8 characters."
+                                passphrase != confirmation -> localError = "The passphrases do not match."
+                                else -> exportLauncher.launch(defaultBackupFilename())
+                            }
+                        },
+                        enabled = !backupState.isBusy,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.FileUpload, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Choose location & export")
+                    }
+                }
+            }
+        }
+
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
+                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Restore, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(10.dp))
+                        Column {
+                            Text("Restore a backup", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "Merges safely; unchanged or newer local notes are kept.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            if (passphrase.length < 8) {
+                                localError = "Enter the backup passphrase first."
+                            } else {
+                                restoreLauncher.launch(arrayOf("application/octet-stream", "application/zip", "*/*"))
+                            }
+                        },
+                        enabled = !backupState.isBusy,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.FileDownload, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Choose backup & restore")
+                    }
+                }
+            }
+        }
+
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
+                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Privacy posture", fontWeight = FontWeight.SemiBold)
+                    PrivacyRow(Icons.Default.PhoneAndroid, "Notes and inference stay on this device")
+                    PrivacyRow(Icons.Default.CloudOff, "Android cloud backup is disabled")
+                    PrivacyRow(Icons.Default.WifiOff, "Cleartext network traffic is blocked")
+                    PrivacyRow(Icons.Default.Key, "Your passphrase is never saved by the app")
+                }
+            }
+        }
+
+        if (backupState.isBusy || backupState.message != null || backupState.error != null) item {
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = if (backupState.error != null) MaterialTheme.colorScheme.errorContainer
+                else MaterialTheme.colorScheme.tertiaryContainer
+            ) {
+                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (backupState.isBusy) {
+                        CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                    } else {
+                        Icon(
+                            if (backupState.error != null) Icons.Default.ErrorOutline else Icons.Default.CheckCircle,
+                            contentDescription = null
+                        )
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Text(backupState.error ?: backupState.message.orEmpty(), Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PrivacyRow(icon: androidx.compose.ui.graphics.vector.ImageVector, text: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(icon, null, Modifier.size(18.dp))
+        Spacer(Modifier.width(9.dp))
+        Text(text, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+private fun defaultBackupFilename(): String =
+    "second-brain-${SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())}.sbrain"
 
 @Composable
 fun ChatScreen(viewModel: BrainViewModel) {

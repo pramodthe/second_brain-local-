@@ -46,7 +46,7 @@ Capture is intentionally durable-first. Original text or audio is written to pri
 - **Phase 3 — Processing queue (complete):** persistent, resumable AI jobs with visible status, retries, cancellation, and deduplication.
 - **Phase 4 — Knowledge quality (complete):** aliases, duplicate resolution, evidence, confidence, and review workflows.
 - **Phase 5 — Retrieval (complete):** hybrid-ranked search, related notes, timelines, and source-grounded answers.
-- **Phase 6 — Ownership:** encrypted export, backup, restore, and production hardening.
+- **Phase 6 — Ownership (complete):** encrypted export, safe merge restore, privacy controls, and production hardening.
 
 ## Requirements
 
@@ -121,6 +121,14 @@ Results include a relevance score, the matching passage, and human-readable reas
 
 Chat receives only accepted graph facts and numbered note sources. The system prompt requires square-bracket citations such as `[1]`, refuses unsupported answers, and never sends notes off-device. Expanding **Sources used** beneath an answer shows the exact passages and ranking evidence behind those citations. When the LLM is not loaded, the app still returns the ranked local passages instead of presenting an ungrounded answer.
 
+## Encrypted backup and restore
+
+The **Own** screen creates a portable `.sbrain` archive containing notes, accepted graph data, aliases, evidence, review history, and—optionally—voice recordings. Model files are deliberately excluded. Before the archive leaves app-private storage, it is encrypted with AES-256-GCM using a key derived from the user’s passphrase with PBKDF2-HMAC-SHA256 and a unique random salt. The passphrase is never persisted and cannot be recovered by the app.
+
+Restore decrypts and validates the authenticated archive, rejects unsafe paths and oversized entries, regenerates local search embeddings, and merges records without deleting the existing library. Notes already present with the same or a newer modification time remain untouched. Restore archives are processed through temporary app-private storage and removed after completion.
+
+Android cloud backup is disabled so the raw database and recordings are not copied to a cloud account behind the user’s back. Cleartext network traffic is also blocked; HTTPS remains available only for optional model downloads. The live database is protected by Android’s app sandbox but is not currently encrypted at rest, so device-level encryption and a secure screen lock are still recommended.
+
 ## Verify on a device
 
 After installing a debug build, run the diagnostic receiver:
@@ -176,7 +184,7 @@ app/src/main/java/com/secondbrain/app/
 
 ## Privacy and security notes
 
-Knowledge and original voice recordings are stored in the app’s private Android storage. Optional model downloads contact Hugging Face only to fetch model files; once installed, inference runs on-device. Android backups may include app-private data while `allowBackup` is enabled. Review third-party dependency licenses and secure or remove the diagnostic receiver before distributing a production APK.
+Knowledge and original voice recordings are stored in the app’s private Android storage. Optional model downloads contact Hugging Face only to fetch model files; once installed, inference runs on-device. Android cloud backup and cleartext traffic are disabled. The diagnostic receiver exists only in debug builds and is not packaged into release builds. Review third-party dependency licenses before distribution.
 
 ## Contributing
 
