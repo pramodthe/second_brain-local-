@@ -58,6 +58,7 @@ import com.secondbrain.app.data.ProcessingJobType
 import com.secondbrain.app.data.RelationEdge
 import com.secondbrain.app.data.RetrievedSource
 import com.secondbrain.app.data.TranscriptionStatus
+import com.secondbrain.app.domain.DailyReview
 import androidx.core.content.ContextCompat
 import java.text.DateFormat
 import java.text.SimpleDateFormat
@@ -323,6 +324,10 @@ fun TodayScreen(
     val jobs by viewModel.processingJobs.collectAsState()
     val reviews by viewModel.knowledgeReviews.collectAsState()
     val actionItems by viewModel.actionItems.collectAsState()
+    val dailyReview by viewModel.dailyReview.collectAsState()
+    val dailyBriefing by viewModel.dailyBriefing.collectAsState()
+    val modelLoaded by viewModel.modelLoaded.collectAsState()
+    val isModelBusy by viewModel.isModelBusy.collectAsState()
     val isIngesting by viewModel.isIngesting.collectAsState()
     val isRecording by viewModel.isRecording.collectAsState()
     val recordingElapsedMs by viewModel.recordingElapsedMs.collectAsState()
@@ -352,13 +357,6 @@ fun TodayScreen(
         openActions.count { actionDueDate(it)?.isAfter(today) == false }
     }
     val notesById = remember(notes) { notes.associateBy(NoteDocument::id) }
-    val memoryToResurface = remember(notes, startOfToday) {
-        val older = notes.filter { it.timestamp < startOfToday }
-        older.takeIf { it.isNotEmpty() }?.let {
-            it[LocalDate.now().dayOfYear % it.size]
-        }
-    }
-
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 104.dp),
@@ -520,6 +518,25 @@ fun TodayScreen(
         }
 
         item {
+            DailyReviewCard(
+                review = dailyReview,
+                briefing = dailyBriefing,
+                modelLoaded = modelLoaded,
+                modelBusy = isModelBusy,
+                sourceNotes = remember(dailyReview, notesById, todaysNotes) {
+                    (dailyReview.focusActions.mapNotNull { notesById[it.noteId] } +
+                        dailyReview.memories.map { it.note } +
+                        todaysNotes.take(3))
+                        .distinctBy(NoteDocument::id)
+                        .take(6)
+                },
+                enabled = !isRecording,
+                onGenerate = viewModel::generateDailyBriefing,
+                onOpenNote = onEditNote
+            )
+        }
+
+        item {
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -568,6 +585,9 @@ fun TodayScreen(
                     onToggle = { viewModel.updateActionStatus(action, ActionStatus.COMPLETED) },
                     onDismiss = { viewModel.updateActionStatus(action, ActionStatus.DISMISSED) },
                     onEdit = { onEditAction(action) },
+                    onRescheduleTomorrow = {
+                        viewModel.saveAction(action, action.text, LocalDate.now().plusDays(1))
+                    },
                     onOpenNote = notesById[action.noteId]?.let { note -> { onEditNote(note) } }
                 )
             }
@@ -659,13 +679,20 @@ fun TodayScreen(
             }
         }
 
-        memoryToResurface?.let { memory ->
+        if (dailyReview.memories.isNotEmpty()) {
             item {
-                Text("From your memory", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Column {
+                    Text("Worth revisiting", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Selected from your notes using active actions and connected topics.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
-            item {
+            items(dailyReview.memories, key = { "resurface-${it.note.id}" }) { memory ->
                 Card(
-                    onClick = { onEditNote(memory) },
+                    onClick = { onEditNote(memory.note) },
                     enabled = !isRecording,
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
                     shape = RoundedCornerShape(18.dp)
@@ -674,11 +701,18 @@ fun TodayScreen(
                         Icon(Icons.Default.History, null)
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(noteDisplayTitle(memory), fontWeight = FontWeight.SemiBold, maxLines = 1)
+                            Text(noteDisplayTitle(memory.note), fontWeight = FontWeight.SemiBold, maxLines = 1)
                             Text(
-                                "Saved ${formatRelativeDay(memory.timestamp)} · ${notePreviewText(memory)}",
+                                memory.reason,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                "Saved ${formatRelativeDay(memory.note.timestamp)} · ${notePreviewText(memory.note)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.78f),
                                 maxLines = 2,
                                 overflow = TextOverflow.Ellipsis
                             )
@@ -704,6 +738,147 @@ private fun TodayMetric(
             Spacer(Modifier.height(8.dp))
             Text(value.toString(), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+private fun DailyReviewCard(
+    review: DailyReview,
+    briefing: DailyBriefingUiState,
+    modelLoaded: Boolean,
+    modelBusy: Boolean,
+    sourceNotes: List<NoteDocument>,
+    enabled: Boolean,
+    onGenerate: () -> Unit,
+    onOpenNote: (NoteDocument) -> Unit
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+        shape = RoundedCornerShape(22.dp)
+    ) {
+        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primary) {
+                    Icon(
+                        Icons.Default.AutoAwesome,
+                        contentDescription = null,
+                        modifier = Modifier.padding(9.dp).size(20.dp),
+                        tint = MaterialTheme.colorScheme.onPrimary
+                    )
+                }
+                Spacer(Modifier.width(11.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Daily review", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "An explainable plan from your local notes and actions",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                }
+            }
+
+            Text(review.summary, style = MaterialTheme.typography.bodyLarge)
+
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                item {
+                    ReviewMetricPill(
+                        label = "${review.overdueCount} overdue",
+                        icon = Icons.Default.WarningAmber
+                    )
+                }
+                item {
+                    ReviewMetricPill(
+                        label = "${review.dueTodayCount} due today",
+                        icon = Icons.Default.Event
+                    )
+                }
+                item {
+                    ReviewMetricPill(
+                        label = "${review.completedTodayCount} completed",
+                        icon = Icons.Default.TaskAlt
+                    )
+                }
+            }
+
+            if (briefing.text.isNotBlank()) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Memory, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
+                            Spacer(Modifier.width(7.dp))
+                            Text("On-device briefing", fontWeight = FontWeight.SemiBold)
+                        }
+                        Text(briefing.text, style = MaterialTheme.typography.bodyMedium)
+                        if (sourceNotes.isNotEmpty()) {
+                            Text("Open sources", style = MaterialTheme.typography.labelMedium)
+                            LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                items(sourceNotes, key = { "brief-source-${it.id}" }) { note ->
+                                    SuggestionChip(
+                                        onClick = { onOpenNote(note) },
+                                        label = {
+                                            Text(
+                                                noteDisplayTitle(note),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            briefing.error?.let { error ->
+                Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            }
+
+            OutlinedButton(
+                onClick = onGenerate,
+                enabled = enabled && modelLoaded && !briefing.isGenerating && !modelBusy,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                if (briefing.isGenerating) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Default.AutoAwesome, null, Modifier.size(18.dp))
+                }
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    when {
+                        briefing.isGenerating -> "Writing on-device…"
+                        briefing.text.isNotBlank() -> "Refresh AI briefing"
+                        modelBusy -> "Local model loading…"
+                        !modelLoaded -> "AI briefing available when model is ready"
+                        else -> "Create AI briefing"
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReviewMetricPill(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f),
+        shape = RoundedCornerShape(50)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(icon, null, Modifier.size(17.dp), tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.width(6.dp))
+            Text(label, style = MaterialTheme.typography.labelLarge)
         }
     }
 }
@@ -753,6 +928,7 @@ private fun ActionItemCard(
     onToggle: () -> Unit,
     onDismiss: (() -> Unit)? = null,
     onEdit: (() -> Unit)? = null,
+    onRescheduleTomorrow: (() -> Unit)? = null,
     onOpenNote: (() -> Unit)? = null
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
@@ -842,6 +1018,16 @@ private fun ActionItemCard(
                                 onClick = {
                                     menuExpanded = false
                                     edit()
+                                }
+                            )
+                        }
+                        if (!completed && onRescheduleTomorrow != null) {
+                            DropdownMenuItem(
+                                text = { Text("Move to tomorrow") },
+                                leadingIcon = { Icon(Icons.Default.Event, null) },
+                                onClick = {
+                                    menuExpanded = false
+                                    onRescheduleTomorrow()
                                 }
                             )
                         }
@@ -1927,6 +2113,17 @@ fun ProcessingScreen(
                                     null
                                 },
                                 onEdit = { onEditAction(action) },
+                                onRescheduleTomorrow = if (action.status == ActionStatus.OPEN) {
+                                    {
+                                        viewModel.saveAction(
+                                            action,
+                                            action.text,
+                                            LocalDate.now().plusDays(1)
+                                        )
+                                    }
+                                } else {
+                                    null
+                                },
                                 onOpenNote = sourceNote?.let { note -> { onEditNote(note) } }
                             )
                         }

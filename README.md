@@ -6,7 +6,7 @@ An offline-first Android knowledge workspace that turns notes and shared text in
 
 ## Highlights
 
-- Start from a daily workspace with one-tap text or voice capture, automatic titles, and resurfaced memories.
+- Start from a daily workspace with one-tap text or voice capture, automatic titles, an explainable daily plan, and relevance-ranked memories.
 - Turn explicit TODOs, reminders, and unchecked checklist lines into local actions with evidence-backed due dates.
 - Capture notes in the app or share plain text from another Android app.
 - Record voice notes, preserve the original audio, play it back, and transcribe it fully offline.
@@ -53,7 +53,7 @@ Capture is intentionally durable-first. Original text or audio is written to pri
 - **Phase 4 — Knowledge quality (complete):** aliases, duplicate resolution, evidence, confidence, and review workflows.
 - **Phase 5 — Retrieval (complete):** hybrid-ranked search, related notes, timelines, and source-grounded answers.
 - **Phase 6 — Ownership (complete):** encrypted export, safe merge restore, privacy controls, and production hardening.
-- **Phase 7 — Daily brain (in progress):** Today workspace, zero-friction capture, automatic titles, memory resurfacing, grouped actions, direct action editing, and private due reminders.
+- **Phase 7 — Daily brain (in progress):** Today workspace, zero-friction capture, automatic titles, explainable daily reviews, grounded on-device briefings, relevance-ranked memories, grouped actions, direct action editing, and private due reminders.
 
 ## Requirements
 
@@ -70,13 +70,19 @@ The app is packaged only for `arm64-v8a`, because its on-device dependencies inc
 
 The app opens on **Today**, not the database or graph. Type directly into Quick capture and save without choosing a title, category, or folder; the original note and timestamp are persisted immediately, and a concise title is derived locally from its first meaningful line. Ontology extraction and embeddings continue through the background queue.
 
-The microphone button starts a voice note from the same card. Stopping preserves the original recording first, then queues offline transcription. When the transcript arrives, an untitled voice note receives a local title derived from the transcript. Today also surfaces current processing or review work, the day's recent memories, and one older memory without modifying it.
+The microphone button starts a voice note from the same card. Stopping preserves the original recording first, then queues offline transcription. When the transcript arrives, an untitled voice note receives a local title derived from the transcript. Today also surfaces current processing or review work and the day's recent memories.
+
+## Intelligent daily review
+
+Today builds an instant daily plan locally, without waiting for the 9B model. It prioritizes overdue, due-today, upcoming, and undated actions; tracks today's completed work; and resurfaces older notes using shared accepted entities, active-action provenance, recurring topics, age, and recency. Each resurfaced memory explains why it was selected and opens its original note.
+
+When the Qwen model is loaded, **Create AI briefing** produces an optional concise summary from only the selected actions, accepted graph facts, and numbered source notes. The response streams on-device and exposes buttons back to its original notes. The deterministic review remains usable while the model is absent, loading, or busy.
 
 ## Actions and reminders
 
 Explicit action language is extracted immediately when a text note is saved, without waiting for the large language model. It is stored locally with its source note, confidence, evidence, and optional due date. Supported deterministic forms include `TODO:`, `Task:`, `Reminder:`, `remind me to`, `need to`, and Markdown checkboxes such as `- [ ]`. Relative dates such as `today`, `tomorrow`, and `next Monday`, ISO dates, and named dates are resolved against the note's original capture date. Voice transcripts receive the same immediate pass as soon as transcription completes.
 
-The model may propose additional actions in the background, but the app only saves proposals whose evidence is an exact substring of the note. It does not invent a due date when the quoted evidence has none. Open actions appear on Today and in **Tasks → Actions**, grouped into Overdue, Today, Upcoming, and No date; completed items have their own section. Actions can also be created directly, edited, completed, reopened, or dismissed. User edits remain authoritative when a source note is reprocessed, and completed or dismissed work is not resurrected.
+The model may propose additional actions in the background, but the app only saves proposals whose evidence is an exact substring of the note. It does not invent a due date when the quoted evidence has none. Open actions appear on Today and in **Tasks → Actions**, grouped into Overdue, Today, Upcoming, and No date; completed items have their own section. Actions can also be created directly, edited, completed, reopened, moved to tomorrow with one tap, or dismissed. User edits remain authoritative when a source note is reprocessed, and completed or dismissed work is not resurrected.
 
 Actions with due dates use WorkManager to schedule an on-device reminder around 9:00 am in the device's local time. Android 13 and newer ask for notification permission only when a dated action is saved. Reminder contents use private lock-screen visibility, overdue migrations are not allowed to flood the notification tray, and delivery state stays local rather than being included in portable backups.
 
