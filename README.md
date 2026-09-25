@@ -53,7 +53,7 @@ Capture is intentionally durable-first. Original text or audio is written to pri
 - **Phase 4 — Knowledge quality (complete):** aliases, duplicate resolution, evidence, confidence, and review workflows.
 - **Phase 5 — Retrieval (complete):** hybrid-ranked search, related notes, timelines, and source-grounded answers.
 - **Phase 6 — Ownership (complete):** encrypted export, safe merge restore, privacy controls, and production hardening.
-- **Phase 7 — Daily brain (in progress):** Today workspace, zero-friction capture, automatic titles, memory resurfacing, and daily action views.
+- **Phase 7 — Daily brain (in progress):** Today workspace, zero-friction capture, automatic titles, memory resurfacing, grouped actions, direct action editing, and private due reminders.
 
 ## Requirements
 
@@ -74,9 +74,11 @@ The microphone button starts a voice note from the same card. Stopping preserves
 
 ## Actions and reminders
 
-Explicit action language is extracted during background organization and stored locally with its source note, confidence, evidence, and optional due date. Supported deterministic forms include `TODO:`, `Task:`, `Reminder:`, `remind me to`, `need to`, and Markdown checkboxes such as `- [ ]`. Relative dates such as `today`, `tomorrow`, and `next Monday`, ISO dates, and named dates are resolved against the note's original capture date.
+Explicit action language is extracted immediately when a text note is saved, without waiting for the large language model. It is stored locally with its source note, confidence, evidence, and optional due date. Supported deterministic forms include `TODO:`, `Task:`, `Reminder:`, `remind me to`, `need to`, and Markdown checkboxes such as `- [ ]`. Relative dates such as `today`, `tomorrow`, and `next Monday`, ISO dates, and named dates are resolved against the note's original capture date. Voice transcripts receive the same immediate pass as soon as transcription completes.
 
-The model may propose additional actions, but the app only saves proposals whose evidence is an exact substring of the note. It does not invent a due date when the quoted evidence has none. Open actions appear on Today and in **Tasks → Actions**, where they can be completed, reopened, or dismissed. Reprocessing an edited note refreshes open proposals without resurrecting completed or dismissed work.
+The model may propose additional actions in the background, but the app only saves proposals whose evidence is an exact substring of the note. It does not invent a due date when the quoted evidence has none. Open actions appear on Today and in **Tasks → Actions**, grouped into Overdue, Today, Upcoming, and No date; completed items have their own section. Actions can also be created directly, edited, completed, reopened, or dismissed. User edits remain authoritative when a source note is reprocessed, and completed or dismissed work is not resurrected.
+
+Actions with due dates use WorkManager to schedule an on-device reminder around 9:00 am in the device's local time. Android 13 and newer ask for notification permission only when a dated action is saved. Reminder contents use private lock-screen visibility, overdue migrations are not allowed to flood the notification tray, and delivery state stays local rather than being included in portable backups.
 
 ## Build and run
 
@@ -111,7 +113,7 @@ The engine tries NPU, GPU, and CPU in that order. On the tested RMX5011/Snapdrag
 
 ## Reliable background processing
 
-Every transcription and ontology-extraction request is first persisted in CozoDB. Android WorkManager then drains this queue serially so only one heavy on-device inference task runs at a time. Stable job IDs deduplicate repeated requests, while a note edited during processing supersedes the older run and is processed again with its latest contents.
+Every transcription and ontology-extraction request is first persisted in CozoDB. Deterministic action extraction runs before the heavy queue, so an explicit TODO is usable as soon as its note is safe. Android WorkManager then drains model work serially so only one heavy on-device inference task runs at a time. Stable job IDs deduplicate repeated requests, while a note edited during processing supersedes the older run and is processed again with its latest contents.
 
 The **Tasks** screen separates background processing, extracted actions, and knowledge review. It shows queued, running, completed, failed, and cancelled work with progress and attempt counts. Failed or cancelled jobs can be retried; active jobs can be cancelled cooperatively. If Android terminates the process, any interrupted job returns to the queue when WorkManager or the app starts again.
 
@@ -196,6 +198,17 @@ adb shell am broadcast \
   -a com.secondbrain.app.PROBE \
   -n com.secondbrain.app/.probe.BrainProbeReceiver \
   --ez actions_only true
+adb logcat -d -s BrainProbe:V
+```
+
+To verify the WorkManager reminder path on Android 13 or newer, first grant notification permission through the in-app prompt (save any dated action). On devices that allow the ADB shell to grant runtime permissions, you can use the first command below. Then run the self-cleaning reminder probe:
+
+```bash
+adb shell pm grant com.secondbrain.app android.permission.POST_NOTIFICATIONS
+adb shell am broadcast \
+  -a com.secondbrain.app.PROBE \
+  -n com.secondbrain.app/.probe.BrainProbeReceiver \
+  --ez reminders_only true
 adb logcat -d -s BrainProbe:V
 ```
 

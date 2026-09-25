@@ -38,5 +38,14 @@ data class ActionItem(
             val uuid = UUID.nameUUIDFromBytes("$noteId|$normalized".toByteArray(StandardCharsets.UTF_8))
             return "action-$uuid"
         }
+
+        fun manual(text: String, dueTimestamp: Double? = null): ActionItem = ActionItem(
+            id = "action-${UUID.randomUUID()}",
+            noteId = "",
+            text = text.trim(),
+            dueTimestamp = dueTimestamp,
+            confidence = 1.0,
+            evidence = "Created directly"
+        )
     }
 }

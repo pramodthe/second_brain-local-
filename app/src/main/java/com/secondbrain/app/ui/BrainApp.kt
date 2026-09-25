@@ -2,6 +2,7 @@ package com.secondbrain.app.ui
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -64,6 +65,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneId
+import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
 import java.util.Date
@@ -92,14 +94,41 @@ fun BrainApp(viewModel: BrainViewModel) {
     var selectedTab by rememberSaveable { mutableStateOf(BrainTab.TODAY) }
     var showComposer by rememberSaveable { mutableStateOf(false) }
     var editingNote by remember { mutableStateOf<NoteDocument?>(null) }
+    var showActionEditor by rememberSaveable { mutableStateOf(false) }
+    var editingAction by remember { mutableStateOf<ActionItem?>(null) }
     val appError by viewModel.appError.collectAsState()
+    val openActionsRequest by viewModel.openActionsRequest.collectAsState()
     val isRecording by viewModel.isRecording.collectAsState()
+    var openProcessingInActions by rememberSaveable { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
+    val context = LocalContext.current
+    val notificationPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) viewModel.refreshData()
+    }
+    val requestNotificationPermission = {
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     LaunchedEffect(appError) {
         appError?.let {
             snackbarHostState.showSnackbar(it)
             viewModel.clearAppError()
+        }
+    }
+
+    LaunchedEffect(openActionsRequest) {
+        if (openActionsRequest > 0L) {
+            openProcessingInActions = true
+            selectedTab = BrainTab.PROCESSING
+            viewModel.consumeOpenActionsRequest()
         }
     }
 
@@ -200,7 +229,19 @@ fun BrainApp(viewModel: BrainViewModel) {
                         editingNote = note
                         showComposer = true
                     },
+                    onNewAction = {
+                        editingAction = null
+                        showActionEditor = true
+                    },
+                    onEditAction = { action ->
+                        editingAction = action
+                        showActionEditor = true
+                    },
                     onOpenNotes = { selectedTab = BrainTab.NOTES },
+                    onOpenActions = {
+                        openProcessingInActions = true
+                        selectedTab = BrainTab.PROCESSING
+                    },
                     onOpenProcessing = { selectedTab = BrainTab.PROCESSING }
                 )
                 BrainTab.NOTES -> NotesScreen(
@@ -215,7 +256,23 @@ fun BrainApp(viewModel: BrainViewModel) {
                     }
                 )
                 BrainTab.EXPLORE -> GraphScreen(viewModel)
-                BrainTab.PROCESSING -> ProcessingScreen(viewModel)
+                BrainTab.PROCESSING -> ProcessingScreen(
+                    viewModel = viewModel,
+                    onNewAction = {
+                        editingAction = null
+                        showActionEditor = true
+                    },
+                    onEditAction = { action ->
+                        editingAction = action
+                        showActionEditor = true
+                    },
+                    onEditNote = { note ->
+                        editingNote = note
+                        showComposer = true
+                    },
+                    openActionsInitially = openProcessingInActions,
+                    onInitialActionsOpened = { openProcessingInActions = false }
+                )
                 BrainTab.ASK -> ChatScreen(viewModel)
                 BrainTab.OWNERSHIP -> OwnershipScreen(viewModel)
             }
@@ -232,6 +289,23 @@ fun BrainApp(viewModel: BrainViewModel) {
             }
         )
     }
+
+    if (showActionEditor) {
+        ActionEditorSheet(
+            action = editingAction,
+            onDismiss = {
+                showActionEditor = false
+                editingAction = null
+            },
+            onSave = { text, dueDate ->
+                if (dueDate != null) requestNotificationPermission()
+                viewModel.saveAction(editingAction, text, dueDate) {
+                    showActionEditor = false
+                    editingAction = null
+                }
+            }
+        )
+    }
 }
 
 @Composable
@@ -239,7 +313,10 @@ fun TodayScreen(
     viewModel: BrainViewModel,
     onNewNote: () -> Unit,
     onEditNote: (NoteDocument) -> Unit,
+    onNewAction: () -> Unit,
+    onEditAction: (ActionItem) -> Unit,
     onOpenNotes: () -> Unit,
+    onOpenActions: () -> Unit,
     onOpenProcessing: () -> Unit
 ) {
     val notes by viewModel.notes.collectAsState()
@@ -457,7 +534,14 @@ fun TodayScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                TextButton(onClick = onOpenProcessing, enabled = !isRecording) { Text("Manage") }
+                Row {
+                    TextButton(onClick = onNewAction, enabled = !isRecording) {
+                        Icon(Icons.Default.Add, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Add")
+                    }
+                    TextButton(onClick = onOpenActions, enabled = !isRecording) { Text("Manage") }
+                }
             }
         }
 
@@ -483,6 +567,7 @@ fun TodayScreen(
                     enabled = !isRecording,
                     onToggle = { viewModel.updateActionStatus(action, ActionStatus.COMPLETED) },
                     onDismiss = { viewModel.updateActionStatus(action, ActionStatus.DISMISSED) },
+                    onEdit = { onEditAction(action) },
                     onOpenNote = notesById[action.noteId]?.let { note -> { onEditNote(note) } }
                 )
             }
@@ -667,8 +752,10 @@ private fun ActionItemCard(
     enabled: Boolean = true,
     onToggle: () -> Unit,
     onDismiss: (() -> Unit)? = null,
+    onEdit: (() -> Unit)? = null,
     onOpenNote: (() -> Unit)? = null
 ) {
+    var menuExpanded by remember { mutableStateOf(false) }
     val completed = item.status == ActionStatus.COMPLETED
     val dueDate = actionDueDate(item)
     val overdue = item.status == ActionStatus.OPEN && dueDate?.isBefore(LocalDate.now()) == true
@@ -739,11 +826,170 @@ private fun ActionItemCard(
                     }
                 }
             }
-            if (!completed && onDismiss != null) {
-                IconButton(onClick = onDismiss, enabled = enabled) {
-                    Icon(Icons.Default.Close, contentDescription = "Dismiss action")
+            if (onEdit != null || (!completed && onDismiss != null)) {
+                Box {
+                    IconButton(onClick = { menuExpanded = true }, enabled = enabled) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "Action options")
+                    }
+                    DropdownMenu(
+                        expanded = menuExpanded,
+                        onDismissRequest = { menuExpanded = false }
+                    ) {
+                        onEdit?.let { edit ->
+                            DropdownMenuItem(
+                                text = { Text("Edit action") },
+                                leadingIcon = { Icon(Icons.Default.Edit, null) },
+                                onClick = {
+                                    menuExpanded = false
+                                    edit()
+                                }
+                            )
+                        }
+                        if (!completed && onDismiss != null) {
+                            DropdownMenuItem(
+                                text = { Text("Dismiss") },
+                                leadingIcon = { Icon(Icons.Default.Close, null) },
+                                onClick = {
+                                    menuExpanded = false
+                                    onDismiss()
+                                }
+                            )
+                        }
+                    }
                 }
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ActionEditorSheet(
+    action: ActionItem?,
+    onDismiss: () -> Unit,
+    onSave: (String, LocalDate?) -> Unit
+) {
+    var text by remember(action?.id) { mutableStateOf(action?.text.orEmpty()) }
+    var dueDate by remember(action?.id) { mutableStateOf(action?.let(::actionDueDate)) }
+    var showDatePicker by remember { mutableStateOf(false) }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .imePadding()
+                .verticalScroll(rememberScrollState())
+                .padding(start = 20.dp, end = 20.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Column {
+                Text(
+                    if (action == null) "New action" else "Edit action",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    if (action?.noteId?.isNotBlank() == true) {
+                        "This keeps its link to the original note."
+                    } else {
+                        "Add something you want to move forward."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it.take(240) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Action") },
+                placeholder = { Text("What needs to happen?") },
+                minLines = 2,
+                maxLines = 4,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(
+                    onDone = { if (text.isNotBlank()) onSave(text.trim(), dueDate) }
+                ),
+                shape = RoundedCornerShape(14.dp)
+            )
+            Text("Due date", style = MaterialTheme.typography.titleSmall)
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                item {
+                    FilterChip(
+                        selected = dueDate == null,
+                        onClick = { dueDate = null },
+                        label = { Text("No date") }
+                    )
+                }
+                item {
+                    FilterChip(
+                        selected = dueDate == LocalDate.now(),
+                        onClick = { dueDate = LocalDate.now() },
+                        label = { Text("Today") }
+                    )
+                }
+                item {
+                    FilterChip(
+                        selected = dueDate == LocalDate.now().plusDays(1),
+                        onClick = { dueDate = LocalDate.now().plusDays(1) },
+                        label = { Text("Tomorrow") }
+                    )
+                }
+                item {
+                    OutlinedButton(onClick = { showDatePicker = true }) {
+                        Icon(Icons.Default.CalendarMonth, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            dueDate?.format(DateTimeFormatter.ofPattern("d MMM yyyy", Locale.getDefault()))
+                                ?: "Choose date"
+                        )
+                    }
+                }
+            }
+            if (dueDate != null) {
+                Text(
+                    "Second Brain will send a private on-device reminder around 9:00 am.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Button(
+                onClick = { onSave(text.trim(), dueDate) },
+                enabled = text.isNotBlank(),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Icon(Icons.Default.Check, null)
+                Spacer(Modifier.width(8.dp))
+                Text(if (action == null) "Add action" else "Save changes")
+            }
+        }
+    }
+
+    if (showDatePicker) {
+        val pickerState = rememberDatePickerState(
+            initialSelectedDateMillis = dueDate
+                ?.atStartOfDay(ZoneOffset.UTC)
+                ?.toInstant()
+                ?.toEpochMilli()
+        )
+        DatePickerDialog(
+            onDismissRequest = { showDatePicker = false },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        dueDate = pickerState.selectedDateMillis?.let {
+                            Instant.ofEpochMilli(it).atZone(ZoneOffset.UTC).toLocalDate()
+                        }
+                        showDatePicker = false
+                    },
+                    enabled = pickerState.selectedDateMillis != null
+                ) { Text("Choose") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDatePicker = false }) { Text("Cancel") }
+            }
+        ) {
+            DatePicker(state = pickerState)
         }
     }
 }
@@ -1429,7 +1675,14 @@ private fun NoteComposerSheet(
 private enum class ActivityMode { PROCESSING, ACTIONS, REVIEW }
 
 @Composable
-fun ProcessingScreen(viewModel: BrainViewModel) {
+fun ProcessingScreen(
+    viewModel: BrainViewModel,
+    onNewAction: () -> Unit,
+    onEditAction: (ActionItem) -> Unit,
+    onEditNote: (NoteDocument) -> Unit,
+    openActionsInitially: Boolean,
+    onInitialActionsOpened: () -> Unit
+) {
     val jobs by viewModel.processingJobs.collectAsState()
     val reviews by viewModel.knowledgeReviews.collectAsState()
     val actionItems by viewModel.actionItems.collectAsState()
@@ -1438,10 +1691,30 @@ fun ProcessingScreen(viewModel: BrainViewModel) {
     val visibleActions = remember(actionItems) {
         actionItems.filter { it.status != ActionStatus.DISMISSED }
     }
+    val today = LocalDate.now()
+    val actionGroups = remember(visibleActions, today) {
+        val open = visibleActions.filter { it.status == ActionStatus.OPEN }
+        listOf(
+            "Overdue" to open.filter { actionDueDate(it)?.isBefore(today) == true },
+            "Today" to open.filter { actionDueDate(it) == today },
+            "Upcoming" to open.filter { actionDueDate(it)?.isAfter(today) == true },
+            "No date" to open.filter { actionDueDate(it) == null },
+            "Completed" to visibleActions
+                .filter { it.status == ActionStatus.COMPLETED }
+                .sortedByDescending(ActionItem::updatedTimestamp)
+        ).filter { it.second.isNotEmpty() }
+    }
     val activeCount = jobs.count { it.status.isActive }
     val failedCount = jobs.count { it.status == ProcessingJobStatus.FAILED }
     val completedCount = jobs.count { it.status == ProcessingJobStatus.COMPLETED }
     var mode by rememberSaveable { mutableStateOf(ActivityMode.PROCESSING) }
+
+    LaunchedEffect(openActionsInitially) {
+        if (openActionsInitially) {
+            mode = ActivityMode.ACTIONS
+            onInitialActionsOpened()
+        }
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -1582,6 +1855,17 @@ fun ProcessingScreen(viewModel: BrainViewModel) {
                 }
             }
             ActivityMode.ACTIONS -> {
+                item(key = "new-action") {
+                    FilledTonalButton(
+                        onClick = onNewAction,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Icon(Icons.Default.AddTask, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Add an action")
+                    }
+                }
                 if (visibleActions.isEmpty()) {
                     item {
                         Column(
@@ -1600,33 +1884,52 @@ fun ProcessingScreen(viewModel: BrainViewModel) {
                             Spacer(Modifier.height(16.dp))
                             Text("No actions yet", fontWeight = FontWeight.SemiBold)
                             Text(
-                                "Write TODO, Reminder, or an unchecked checklist in a note.",
+                                "Add one directly, or write TODO, Reminder, or an unchecked checklist in a note.",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 textAlign = TextAlign.Center
                             )
                         }
                     }
                 } else {
-                    items(visibleActions, key = { it.id }) { action ->
-                        ActionItemCard(
-                            item = action,
-                            sourceNote = notesById[action.noteId],
-                            onToggle = {
-                                viewModel.updateActionStatus(
-                                    action,
-                                    if (action.status == ActionStatus.COMPLETED) {
-                                        ActionStatus.OPEN
-                                    } else {
-                                        ActionStatus.COMPLETED
-                                    }
+                    actionGroups.forEach { (label, actions) ->
+                        item(key = "action-section-$label") {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    actions.size.toString(),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
-                            },
-                            onDismiss = if (action.status == ActionStatus.OPEN) {
-                                { viewModel.updateActionStatus(action, ActionStatus.DISMISSED) }
-                            } else {
-                                null
                             }
-                        )
+                        }
+                        items(actions, key = { it.id }) { action ->
+                            val sourceNote = notesById[action.noteId]
+                            ActionItemCard(
+                                item = action,
+                                sourceNote = sourceNote,
+                                onToggle = {
+                                    viewModel.updateActionStatus(
+                                        action,
+                                        if (action.status == ActionStatus.COMPLETED) {
+                                            ActionStatus.OPEN
+                                        } else {
+                                            ActionStatus.COMPLETED
+                                        }
+                                    )
+                                },
+                                onDismiss = if (action.status == ActionStatus.OPEN) {
+                                    { viewModel.updateActionStatus(action, ActionStatus.DISMISSED) }
+                                } else {
+                                    null
+                                },
+                                onEdit = { onEditAction(action) },
+                                onOpenNote = sourceNote?.let { note -> { onEditNote(note) } }
+                            )
+                        }
                     }
                 }
             }

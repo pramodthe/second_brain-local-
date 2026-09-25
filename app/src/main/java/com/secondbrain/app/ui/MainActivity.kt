@@ -22,6 +22,7 @@ class MainActivity : ComponentActivity() {
 
         // Handle Share Sheet intent (sharing article / text from other apps)
         handleShareIntent(intent)
+        handleNavigationIntent(intent)
 
         setContent {
             val isDark = isSystemInDarkTheme()
@@ -63,6 +64,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleShareIntent(intent)
+        handleNavigationIntent(intent)
     }
 
     private fun handleShareIntent(intent: Intent?) {
@@ -71,5 +73,16 @@ class MainActivity : ComponentActivity() {
             val sharedSubject = intent.getStringExtra(Intent.EXTRA_SUBJECT) ?: "Shared Note"
             viewModel.saveNote(sharedSubject, sharedText)
         }
+    }
+
+    private fun handleNavigationIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_OPEN_ACTIONS, false) == true) {
+            viewModel.requestOpenActions()
+            intent.removeExtra(EXTRA_OPEN_ACTIONS)
+        }
+    }
+
+    companion object {
+        const val EXTRA_OPEN_ACTIONS = "open_actions"
     }
 }

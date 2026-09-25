@@ -50,7 +50,7 @@ class BrainProcessingWorker(
 
                 try {
                     when (running.type) {
-                        ProcessingJobType.TRANSCRIBE -> processTranscription(store, speech, running)
+                        ProcessingJobType.TRANSCRIBE -> processTranscription(store, pipeline, speech, running)
                         ProcessingJobType.ORGANIZE -> processOrganization(store, pipeline, llm, running)
                     }
                     if (!isCancelled(store, running.id)) {
@@ -101,6 +101,7 @@ class BrainProcessingWorker(
 
     private suspend fun processTranscription(
         store: BrainStore,
+        pipeline: IngestionPipeline,
         speech: com.secondbrain.app.ai.SpeechEngine,
         job: ProcessingJob
     ) {
@@ -146,6 +147,7 @@ class BrainProcessingWorker(
             transcriptionStatus = TranscriptionStatus.COMPLETE
         )
         store.putNote(completed).getOrThrow()
+        pipeline.syncImmediateActions(completed).getOrThrow()
         updateJob(store, job, ProcessingJobStatus.RUNNING, 92, "Transcript saved")
         store.enqueueProcessingJob(completed.id, ProcessingJobType.ORGANIZE).getOrThrow()
     }

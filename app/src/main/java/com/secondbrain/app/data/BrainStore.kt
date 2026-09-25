@@ -620,15 +620,23 @@ class BrainStore(private val context: Context) {
                 val d = db ?: error("Database not open")
                 val existing = queryActionItems(d, noteId = noteId)
                 val existingById = existing.associateBy(ActionItem::id)
-                existing.filter { it.status == ActionStatus.OPEN }.forEach { removeAction(d, it.id) }
+                val proposalIds = proposals.mapTo(mutableSetOf(), ActionItem::id)
+                existing
+                    .filter { it.status == ActionStatus.OPEN && it.id !in proposalIds }
+                    .forEach { removeAction(d, it.id) }
                 val merged = proposals.mapNotNull { proposal ->
                     val previous = existingById[proposal.id]
                     when (previous?.status) {
                         ActionStatus.COMPLETED, ActionStatus.DISMISSED -> null
-                        else -> proposal.copy(
-                            createdTimestamp = previous?.createdTimestamp ?: proposal.createdTimestamp,
-                            updatedTimestamp = now()
-                        )
+                        else -> {
+                            if (previous != null && previous.dueTimestamp != proposal.dueTimestamp) {
+                                removeActionReminder(d, proposal.id)
+                            }
+                            proposal.copy(
+                                createdTimestamp = previous?.createdTimestamp ?: proposal.createdTimestamp,
+                                updatedTimestamp = now()
+                            )
+                        }
                     }
                 }
                 putActionItems(d, merged)
@@ -650,6 +658,33 @@ class BrainStore(private val context: Context) {
         }
     }
 
+    suspend fun getActionItem(id: String): Result<ActionItem?> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            queryActionItems(d, id = id, limit = 1).firstOrNull()
+        }
+    }
+
+    suspend fun saveAction(item: ActionItem): Result<ActionItem> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            val existing = queryActionItems(d, id = item.id, limit = 1).firstOrNull()
+            val saved = item.copy(
+                text = item.text.trim().take(240),
+                confidence = item.confidence.coerceIn(0.0, 1.0),
+                createdTimestamp = existing?.createdTimestamp ?: item.createdTimestamp,
+                updatedTimestamp = now()
+            )
+            require(saved.text.isNotBlank()) { "Action text cannot be empty" }
+            if (existing != null && existing.dueTimestamp != saved.dueTimestamp) {
+                removeActionReminder(d, saved.id)
+            }
+            putActionItems(d, listOf(saved))
+            if (existing?.noteId?.isNotBlank() == true) putActionOverride(d, saved)
+            saved
+        }
+    }
+
     suspend fun updateActionStatus(id: String, status: ActionStatus): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -668,11 +703,46 @@ class BrainStore(private val context: Context) {
                 val local = queryActionItems(d, id = incoming.id, limit = 1).firstOrNull()
                 if (local == null || incoming.updatedTimestamp > local.updatedTimestamp) {
                     putActionItems(d, listOf(incoming))
+                    if (incoming.noteId.isNotBlank()) {
+                        putActionOverride(d, incoming)
+                    } else {
+                        removeActionOverride(d, incoming.id)
+                    }
                 }
             }
             Unit
         }
     }
+
+    suspend fun wasActionReminderDelivered(id: String, dueTimestamp: Double): Result<Boolean> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val d = db ?: error("Database not open")
+                d.run(
+                    """
+                    ?[due_at, notified_at] := *action_reminder{action_id, due_at, notified_at},
+                        action_id == "${esc(id)}"
+                    :limit 1
+                    """.trimIndent()
+                ).firstOrNull()?.let { row ->
+                    row.rows[0].asDouble() == dueTimestamp && row.rows[1].asDouble() >= 0.0
+                } ?: false
+            }
+        }
+
+    suspend fun markActionReminderDelivered(id: String, dueTimestamp: Double): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val d = db ?: error("Database not open")
+                d.run(
+                    """
+                    ?[action_id, due_at, notified_at] <- [["${esc(id)}", $dueTimestamp, ${now()}]]
+                    :put action_reminder {action_id => due_at, notified_at}
+                    """.trimIndent()
+                )
+                Unit
+            }
+        }
 
     private fun queryActionItems(
         d: CozoDb,
@@ -686,7 +756,7 @@ class BrainStore(private val context: Context) {
             noteId?.let { add("note_id == \"${esc(it)}\"") }
             id?.let { add("id == \"${esc(it)}\"") }
         }.joinToString(separator = ", ", prefix = if (status != null || noteId != null || id != null) ", " else "")
-        return d.run(
+        val actions = d.run(
             """
             ?[id, note_id, text, due_at, status, confidence, evidence, created_at, updated_at] :=
                 *action_item{id, note_id, text, due_at, status, confidence, evidence, created_at, updated_at}$filters
@@ -694,6 +764,16 @@ class BrainStore(private val context: Context) {
             :limit ${limit.coerceIn(1, MAX_BACKUP_ITEMS)}
             """.trimIndent()
         ).map(::actionItemFromRow)
+        val overrides = loadActionOverrides(d)
+        return actions.map { item ->
+            overrides[item.id]?.let { override ->
+                item.copy(
+                    text = override.text,
+                    dueTimestamp = override.dueTimestamp,
+                    updatedTimestamp = maxOf(item.updatedTimestamp, override.updatedTimestamp)
+                )
+            } ?: item
+        }
     }
 
     private fun putActionItems(d: CozoDb, items: List<ActionItem>) {
@@ -716,7 +796,58 @@ class BrainStore(private val context: Context) {
             :rm action_item {id}
             """.trimIndent()
         )
+        removeActionOverride(d, id)
+        removeActionReminder(d, id)
     }
+
+    private fun removeActionOverride(d: CozoDb, id: String) {
+        runCatching {
+            d.run(
+                """
+                ?[id] <- [["${esc(id)}"]]
+                :rm action_override {id}
+                """.trimIndent()
+            )
+        }
+    }
+
+    private fun removeActionReminder(d: CozoDb, id: String) {
+        runCatching {
+            d.run(
+                """
+                ?[action_id] <- [["${esc(id)}"]]
+                :rm action_reminder {action_id}
+                """.trimIndent()
+            )
+        }
+    }
+
+    private fun putActionOverride(d: CozoDb, item: ActionItem) {
+        d.run(
+            """
+            ?[id, text, due_at, updated_at] <- [["${esc(item.id)}", "${esc(item.text)}", ${item.dueTimestamp ?: -1.0}, ${item.updatedTimestamp}]]
+            :put action_override {id => text, due_at, updated_at}
+            """.trimIndent()
+        )
+    }
+
+    private fun loadActionOverrides(d: CozoDb): Map<String, ActionOverride> = runCatching {
+        d.run("?[id, text, due_at, updated_at] := *action_override{id, text, due_at, updated_at}")
+            .associate { row ->
+                val dueAt = row.rows[2].asDouble()
+                row.rows[0].asString() to ActionOverride(
+                    text = row.rows[1].asString(),
+                    dueTimestamp = dueAt.takeIf { it >= 0.0 },
+                    updatedTimestamp = row.rows[3].asDouble()
+                )
+            }
+    }.getOrDefault(emptyMap())
+
+    private data class ActionOverride(
+        val text: String,
+        val dueTimestamp: Double?,
+        val updatedTimestamp: Double
+    )
 
     suspend fun enqueueProcessingJob(
         noteId: String,
@@ -1084,6 +1215,8 @@ class BrainStore(private val context: Context) {
             ":create note_entity {note_id: String, entity_name: String => at: Float}",
             ":create review_item {id: String => kind: String, status: String, note_id: String, subject: String, candidate: String, schema_type: String, description: String, aliases: String, confidence: Float, evidence: String, created_at: Float, updated_at: Float}",
             ":create action_item {id: String => note_id: String, text: String, due_at: Float, status: String, confidence: Float, evidence: String, created_at: Float, updated_at: Float}",
+            ":create action_override {id: String => text: String, due_at: Float, updated_at: Float}",
+            ":create action_reminder {action_id: String => due_at: Float, notified_at: Float}",
             ":create note_vector {note_id: String => embedding: <F32; 256>, at: Float}",
             "::hnsw create note_vector:vec_idx {dim: 256, m: 24, ef_construction: 64, fields: [embedding], distance: Cosine}"
         )

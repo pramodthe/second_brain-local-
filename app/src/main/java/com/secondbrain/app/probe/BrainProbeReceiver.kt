@@ -1,9 +1,14 @@
 package com.secondbrain.app.probe
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.util.Log
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import com.secondbrain.app.ai.EmbedderEngine
 import com.secondbrain.app.ai.LlmEngine
 import com.secondbrain.app.ai.SpeechEngine
@@ -14,9 +19,13 @@ import com.secondbrain.app.data.ProcessingJobType
 import com.secondbrain.app.domain.HybridRetriever
 import com.secondbrain.app.domain.IngestionPipeline
 import com.secondbrain.app.work.ProcessingWorkScheduler
+import com.secondbrain.app.work.ActionReminderScheduler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.time.LocalDate
+import java.time.ZoneId
 
 /**
  * Diagnostic receiver allowing full CLI verification of the Second Brain stack via:
@@ -36,6 +45,8 @@ class BrainProbeReceiver : BroadcastReceiver() {
                     runRetrievalDiagnostic(context.applicationContext)
                 } else if (intent?.getBooleanExtra(EXTRA_ACTIONS_ONLY, false) == true) {
                     runActionsDiagnostic(context.applicationContext)
+                } else if (intent?.getBooleanExtra(EXTRA_REMINDERS_ONLY, false) == true) {
+                    runReminderDiagnostic(context.applicationContext)
                 } else {
                     runDiagnostic(context.applicationContext)
                 }
@@ -45,6 +56,52 @@ class BrainProbeReceiver : BroadcastReceiver() {
                 pending.finish()
             }
         }
+    }
+
+    private suspend fun runReminderDiagnostic(context: Context) {
+        Log.i(TAG, "================== START REMINDER PROBE ==================")
+        val store = BrainStore(context)
+        val dueTimestamp = LocalDate.now()
+            .atStartOfDay(ZoneId.systemDefault())
+            .toEpochSecond()
+            .toDouble()
+        val probe = ActionItem(
+            id = ActionItem.stableId(REMINDER_PROBE_NOTE_ID, "Verify the reminder worker"),
+            noteId = REMINDER_PROBE_NOTE_ID,
+            text = "Verify the reminder worker",
+            dueTimestamp = dueTimestamp,
+            confidence = 1.0,
+            evidence = "TODO: Verify the reminder worker today"
+        )
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                check(
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+                        PackageManager.PERMISSION_GRANTED
+                ) { "Grant notification permission before running the reminder probe" }
+            }
+            store.open().getOrThrow()
+            store.syncOpenActionItems(REMINDER_PROBE_NOTE_ID, listOf(probe)).getOrThrow()
+            ActionReminderScheduler.schedule(context, probe)
+
+            var delivered = false
+            for (attempt in 0 until 40) {
+                delivered = store.wasActionReminderDelivered(probe.id, dueTimestamp).getOrThrow()
+                if (delivered) break
+                delay(250)
+            }
+            check(delivered) { "Reminder worker did not deliver within 10 seconds" }
+            Log.i(TAG, "REMINDER PASS: WorkManager delivered and recorded the due-action notification")
+        } catch (error: Throwable) {
+            Log.e(TAG, "REMINDER FAIL: ${error.message}", error)
+        } finally {
+            NotificationManagerCompat.from(context).cancel(probe.id.hashCode())
+            ActionReminderScheduler.schedule(context, probe.copy(status = ActionStatus.DISMISSED))
+            runCatching { store.updateActionStatus(probe.id, ActionStatus.OPEN).getOrThrow() }
+            runCatching { store.syncOpenActionItems(REMINDER_PROBE_NOTE_ID, emptyList()).getOrThrow() }
+            store.close()
+        }
+        Log.i(TAG, "================== REMINDER PROBE COMPLETE ==================")
     }
 
     private suspend fun runActionsDiagnostic(context: Context) {
@@ -65,6 +122,24 @@ class BrainProbeReceiver : BroadcastReceiver() {
                 .firstOrNull { it.id == probe.id }
             check(inserted?.status == ActionStatus.OPEN) { "Open action was not persisted" }
 
+            check(!store.wasActionReminderDelivered(probe.id, requireNotNull(probe.dueTimestamp)).getOrThrow()) {
+                "A fresh reminder was incorrectly marked as delivered"
+            }
+            store.markActionReminderDelivered(probe.id, requireNotNull(probe.dueTimestamp)).getOrThrow()
+            check(store.wasActionReminderDelivered(probe.id, requireNotNull(probe.dueTimestamp)).getOrThrow()) {
+                "Reminder delivery was not persisted"
+            }
+
+            store.saveAction(probe.copy(text = "Edited action survives reprocessing", dueTimestamp = null)).getOrThrow()
+            store.syncOpenActionItems(ACTION_PROBE_NOTE_ID, listOf(probe)).getOrThrow()
+            val edited = store.getActionItem(probe.id).getOrThrow()
+            check(edited?.text == "Edited action survives reprocessing" && edited.dueTimestamp == null) {
+                "The user action override did not survive extraction sync"
+            }
+            check(!store.wasActionReminderDelivered(probe.id, requireNotNull(probe.dueTimestamp)).getOrThrow()) {
+                "Changing the due date did not reset reminder delivery"
+            }
+
             store.updateActionStatus(probe.id, ActionStatus.COMPLETED).getOrThrow()
             val completed = store.getActionItems(limit = 100_000).getOrThrow()
                 .firstOrNull { it.id == probe.id }
@@ -75,7 +150,10 @@ class BrainProbeReceiver : BroadcastReceiver() {
             check(store.getActionItems(limit = 100_000).getOrThrow().none { it.id == probe.id }) {
                 "Probe action was not cleaned up"
             }
-            Log.i(TAG, "ACTIONS PASS: insert, query, complete, reopen, and cleanup succeeded")
+            Log.i(
+                TAG,
+                "ACTIONS PASS: storage, edit override, reminder state, status changes, and cleanup succeeded"
+            )
         } catch (error: Throwable) {
             Log.e(TAG, "ACTIONS FAIL: ${error.message}", error)
         } finally {
@@ -253,6 +331,8 @@ class BrainProbeReceiver : BroadcastReceiver() {
         private const val EXTRA_QUEUE_ONLY = "queue_only"
         private const val EXTRA_RETRIEVAL_ONLY = "retrieval_only"
         private const val EXTRA_ACTIONS_ONLY = "actions_only"
+        private const val EXTRA_REMINDERS_ONLY = "reminders_only"
         private const val ACTION_PROBE_NOTE_ID = "probe-action-storage"
+        private const val REMINDER_PROBE_NOTE_ID = "probe-action-reminder"
     }
 }

@@ -51,6 +51,7 @@ class IngestionPipeline(
                 transcriptionStatus = transcriptionStatus
             )
             store.putNote(note).getOrThrow()
+            syncImmediateActions(note).getOrThrow()
             note
         }
     }
@@ -68,7 +69,21 @@ class IngestionPipeline(
                 modifiedTimestamp = System.currentTimeMillis() / 1000.0
             )
             store.putNote(updated).getOrThrow()
+            syncImmediateActions(updated).getOrThrow()
             updated
+        }
+    }
+
+    /** Makes explicit TODOs available immediately while richer model extraction stays queued. */
+    suspend fun syncImmediateActions(note: NoteDocument): Result<Int> = withContext(Dispatchers.IO) {
+        runCatching {
+            val capturedDate = Instant.ofEpochSecond(note.timestamp.toLong())
+                .atZone(ZoneId.systemDefault())
+                .toLocalDate()
+            val candidates = ActionExtractor.deterministicCandidates(note.content, capturedDate)
+            val actions = ActionExtractor.toActionItems(note, candidates)
+            store.syncOpenActionItems(note.id, actions).getOrThrow()
+            actions.size
         }
     }
 

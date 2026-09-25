@@ -27,6 +27,7 @@ import com.secondbrain.app.data.SubgraphContext
 import com.secondbrain.app.data.TranscriptionStatus
 import com.secondbrain.app.domain.HybridRetriever
 import com.secondbrain.app.domain.IngestionPipeline
+import com.secondbrain.app.work.ActionReminderScheduler
 import com.secondbrain.app.work.ProcessingWorkScheduler
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -35,6 +36,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.time.LocalDate
+import java.time.ZoneId
 
 data class ChatMessageItem(
     val sender: String, // "user" or "brain"
@@ -115,6 +118,9 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
     private val _actionItems = MutableStateFlow<List<ActionItem>>(emptyList())
     val actionItems: StateFlow<List<ActionItem>> = _actionItems.asStateFlow()
 
+    private val _openActionsRequest = MutableStateFlow(0L)
+    val openActionsRequest: StateFlow<Long> = _openActionsRequest.asStateFlow()
+
     private val _isRecording = MutableStateFlow(false)
     val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
 
@@ -175,6 +181,14 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshData() {
         viewModelScope.launch { loadData() }
+    }
+
+    fun requestOpenActions() {
+        _openActionsRequest.value = System.currentTimeMillis()
+    }
+
+    fun consumeOpenActionsRequest() {
+        _openActionsRequest.value = 0L
     }
 
     fun searchNotes(query: String) {
@@ -259,7 +273,9 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
         _entities.value = store.getAllEntities().getOrDefault(emptyList())
         _edges.value = store.getAllEdges().getOrDefault(emptyList())
         _knowledgeReviews.value = store.getKnowledgeReviews().getOrDefault(emptyList())
-        _actionItems.value = store.getActionItems().getOrDefault(emptyList())
+        val actions = store.getActionItems().getOrDefault(emptyList())
+        _actionItems.value = actions
+        ActionReminderScheduler.sync(getApplication(), actions)
         _stats.value = store.getStats()
     }
 
@@ -493,6 +509,31 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
                     _appError.value = "Could not update the action: ${error.message ?: "unknown error"}"
                 }
             loadData()
+        }
+    }
+
+    fun saveAction(
+        existing: ActionItem?,
+        text: String,
+        dueDate: LocalDate?,
+        onComplete: () -> Unit = {}
+    ) {
+        if (text.isBlank()) return
+        viewModelScope.launch {
+            val dueTimestamp = dueDate
+                ?.atStartOfDay(ZoneId.systemDefault())
+                ?.toEpochSecond()
+                ?.toDouble()
+            val action = existing?.copy(text = text.trim(), dueTimestamp = dueTimestamp)
+                ?: ActionItem.manual(text, dueTimestamp)
+            store.saveAction(action)
+                .onSuccess {
+                    loadData()
+                    onComplete()
+                }
+                .onFailure { error ->
+                    _appError.value = "Could not save the action: ${error.message ?: "unknown error"}"
+                }
         }
     }
 
