@@ -18,6 +18,7 @@ An offline-first Android knowledge workspace that turns notes and shared text in
 - Discover related notes, browse a chronological timeline, and inspect cited source passages.
 - Explore the ontology with an interactive force-directed graph or a filtered list.
 - Use a local Qwen GGUF model for extraction and grounded answers when one is installed.
+- Create, rename, update, trash, restore, and act on notes from the Ask screen through validated local tools.
 - Fall back to deterministic local embeddings and rule-based extraction when the model is unavailable.
 
 ## Architecture
@@ -54,6 +55,7 @@ Capture is intentionally durable-first. Original text or audio is written to pri
 - **Phase 5 — Retrieval (complete):** hybrid-ranked search, related notes, timelines, and source-grounded answers.
 - **Phase 6 — Ownership (complete):** encrypted export, safe merge restore, privacy controls, and production hardening.
 - **Phase 7 — Daily brain (in progress):** Today workspace, zero-friction capture, automatic titles, explainable daily reviews, grounded on-device briefings, relevance-ranked memories, grouped actions, direct action editing, and private due reminders.
+- **Phase 8 — Agent control (in progress):** safe note CRUD, recoverable Trash, cascade deletion, conversational tools, local audit records, provenance support, and correction-aware ontology extraction.
 
 ## Requirements
 
@@ -85,6 +87,31 @@ Explicit action language is extracted immediately when a text note is saved, wit
 The model may propose additional actions in the background, but the app only saves proposals whose evidence is an exact substring of the note. It does not invent a due date when the quoted evidence has none. Open actions appear on Today and in **Tasks → Actions**, grouped into Overdue, Today, Upcoming, and No date; completed items have their own section. Actions can also be created directly, edited, completed, reopened, moved to tomorrow with one tap, or dismissed. User edits remain authoritative when a source note is reprocessed, and completed or dismissed work is not resurrected.
 
 Actions with due dates use WorkManager to schedule an on-device reminder around 9:00 am in the device's local time. Android 13 and newer ask for notification permission only when a dated action is saved. Reminder contents use private lock-screen visibility, overdue migrations are not allowed to flood the notification tray, and delivery state stays local rather than being included in portable backups.
+
+## Note CRUD, Trash, and agent tools
+
+Notes support create, read/search, edit, move to Trash, restore, and permanent deletion. Trash is available from the note card menu, the editor, and the **Notes → Trash** view. Moving a note to Trash immediately hides its actions, processing work, search results, and graph contribution without destroying them. Restoring the note brings those records back and queues fresh organization.
+
+Permanent deletion is only available from Trash and always requires confirmation. It removes the raw note, recording, vector, processing jobs, actions, reminders, review proposals, note-to-entity links, and provenance rows. Entities and relationships are removed only when the deleted note was their final supporting source.
+
+The Ask screen first checks explicit commands against a strict local tool parser; everything else continues through grounded retrieval and Qwen. Supported commands include:
+
+- `Create a note: ...` or `Remember that ...`
+- `List my notes` and `Show my deleted notes`
+- `Rename note Project plan to 2027 plan`
+- `Update note Project plan to say ...`
+- `Delete note Project plan`
+- `Restore note Project plan`
+- `Add task Call Sam tomorrow`
+- `Complete action Call Sam`
+
+Create, restore, list, and action-status tools can run immediately. Trash, rename, and content replacement produce a visible confirmation card before any mutation. Executed tools are recorded in the local audit relation. The language model does not receive unrestricted database access.
+
+## Automatic ontology maintenance
+
+Ontology extraction is automatic background work, not a manual data-entry workflow. Evidence-backed entities and relationships at or above the acceptance threshold enter the graph automatically. Only uncertain claims, possible duplicates, or unsupported endpoints appear in Review.
+
+Accepted duplicate decisions become canonical aliases used by future extraction. Rejected entity and relationship patterns are stored as local feedback rules so the same suggestion is not repeatedly presented. Reprocessing an edited note now removes its stale vector and graph provenance before writing the new result. Entity and relationship support is tracked per source note, allowing Trash to hide a source and permanent deletion to remove only facts that no remaining note supports.
 
 ## Build and run
 
@@ -204,6 +231,16 @@ adb shell am broadcast \
   -a com.secondbrain.app.PROBE \
   -n com.secondbrain.app/.probe.BrainProbeReceiver \
   --ez actions_only true
+adb logcat -d -s BrainProbe:V
+```
+
+To verify create/read/trash/restore, hidden graph contribution, and permanent cascade cleanup:
+
+```bash
+adb shell am broadcast \
+  -a com.secondbrain.app.PROBE \
+  -n com.secondbrain.app/.probe.BrainProbeReceiver \
+  --ez crud_only true
 adb logcat -d -s BrainProbe:V
 ```
 

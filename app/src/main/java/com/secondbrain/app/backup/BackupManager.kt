@@ -131,7 +131,7 @@ class BackupManager(
                 var recordingCount = 0
                 val recordingsDir = File(context.filesDir, "recordings").apply { mkdirs() }
                 payload.notes.forEach { backupNote ->
-                    val local = store.getNote(backupNote.note.id).getOrThrow()
+                    val local = store.getNote(backupNote.note.id, includeTrashed = true).getOrThrow()
                     if (local != null && local.modifiedTimestamp >= backupNote.note.modifiedTimestamp) {
                         skipped++
                         return@forEach

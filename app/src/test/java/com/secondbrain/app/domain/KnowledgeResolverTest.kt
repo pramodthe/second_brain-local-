@@ -4,6 +4,7 @@ import com.secondbrain.app.data.EntityCategory
 import com.secondbrain.app.data.EntityNode
 import com.secondbrain.app.data.ExtractedKnowledge
 import com.secondbrain.app.data.NoteDocument
+import com.secondbrain.app.data.KnowledgeFeedbackKey
 import com.secondbrain.app.data.RelationEdge
 import com.secondbrain.app.data.RelationType
 import com.secondbrain.app.data.ReviewKind
@@ -95,6 +96,31 @@ class KnowledgeResolverTest {
         )
 
         assertEquals("Second Brain", result.accepted.entities.single().name)
+        assertTrue(result.reviews.isEmpty())
+    }
+
+    @Test
+    fun rejectedEntityRulePreventsTheSameSuggestionFromReturning() {
+        val note = note("Jarvis is a project.")
+        val proposal = EntityNode(
+            name = "Jarvis",
+            category = EntityCategory.PROJECT,
+            confidence = 0.95,
+            evidence = "Jarvis is a project"
+        )
+        val rejected = setOf(
+            KnowledgeFeedbackKey.of(ReviewKind.ENTITY, "Jarvis", "", EntityCategory.PROJECT.name)
+        )
+
+        val result = resolver.resolve(
+            note = note,
+            raw = ExtractedKnowledge(listOf(proposal), emptyList()),
+            existing = emptyList(),
+            acceptedAliases = emptyMap(),
+            rejectedRules = rejected
+        )
+
+        assertTrue(result.accepted.entities.isEmpty())
         assertTrue(result.reviews.isEmpty())
     }
 

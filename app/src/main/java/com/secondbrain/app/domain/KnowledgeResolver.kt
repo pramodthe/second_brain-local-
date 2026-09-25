@@ -5,6 +5,7 @@ import com.secondbrain.app.data.ExtractedKnowledge
 import com.secondbrain.app.data.KnowledgeResolution
 import com.secondbrain.app.data.KnowledgeReviewItem
 import com.secondbrain.app.data.KnowledgeStatus
+import com.secondbrain.app.data.KnowledgeFeedbackKey
 import com.secondbrain.app.data.NoteDocument
 import com.secondbrain.app.data.RelationEdge
 import com.secondbrain.app.data.ReviewKind
@@ -21,7 +22,8 @@ class KnowledgeResolver(
         note: NoteDocument,
         raw: ExtractedKnowledge,
         existing: List<EntityNode>,
-        acceptedAliases: Map<String, String>
+        acceptedAliases: Map<String, String>,
+        rejectedRules: Set<String> = emptySet()
     ): KnowledgeResolution {
         val canonicalByKey = existing.associateBy { normalizeName(it.name) }.toMutableMap()
         val aliasByKey = acceptedAliases.mapKeys { normalizeName(it.key) }
@@ -66,17 +68,34 @@ class KnowledgeResolver(
                     ?.takeIf { it.second >= duplicateThreshold }
 
                 if (duplicate != null) {
-                    reviews += reviewItem(
-                        kind = ReviewKind.DUPLICATE,
-                        note = note,
-                        subject = cleanName,
-                        candidate = duplicate.first.name,
-                        schemaType = proposal.category.name,
-                        description = proposal.description,
-                        aliases = cleanAliases,
-                        confidence = max(confidence, duplicate.second),
-                        evidence = evidence
+                    val fingerprint = KnowledgeFeedbackKey.of(
+                        ReviewKind.DUPLICATE,
+                        cleanName,
+                        duplicate.first.name,
+                        proposal.category.name
                     )
+                    if (fingerprint !in rejectedRules) {
+                        reviews += reviewItem(
+                            kind = ReviewKind.DUPLICATE,
+                            note = note,
+                            subject = cleanName,
+                            candidate = duplicate.first.name,
+                            schemaType = proposal.category.name,
+                            description = proposal.description,
+                            aliases = cleanAliases,
+                            confidence = max(confidence, duplicate.second),
+                            evidence = evidence
+                        )
+                    }
+                } else if (
+                    KnowledgeFeedbackKey.of(
+                        ReviewKind.ENTITY,
+                        cleanName,
+                        "",
+                        proposal.category.name
+                    ) in rejectedRules
+                ) {
+                    return@forEach
                 } else if (confidence >= autoAcceptThreshold) {
                     val accepted = proposal.copy(
                         name = cleanName,
@@ -123,6 +142,16 @@ class KnowledgeResolver(
                 )
                 val confidence = proposal.confidence.coerceIn(0.0, 1.0)
                     .let { if (evidenceVerified) it else minOf(it, 0.65) }
+                val reviewSource = source ?: proposal.source.trim()
+                val reviewTarget = target ?: proposal.target.trim()
+                val rejected = KnowledgeFeedbackKey.of(
+                    ReviewKind.RELATION,
+                    reviewSource,
+                    reviewTarget,
+                    proposal.relation.name
+                ) in rejectedRules
+
+                if (rejected) return@mapNotNull null
 
                 if (
                     source != null && target != null &&
@@ -141,8 +170,8 @@ class KnowledgeResolver(
                     reviews += reviewItem(
                         kind = ReviewKind.RELATION,
                         note = note,
-                        subject = source ?: proposal.source.trim(),
-                        candidate = target ?: proposal.target.trim(),
+                        subject = reviewSource,
+                        candidate = reviewTarget,
                         schemaType = proposal.relation.name,
                         confidence = confidence,
                         evidence = evidence

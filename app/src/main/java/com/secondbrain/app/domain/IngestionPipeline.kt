@@ -111,12 +111,14 @@ class IngestionPipeline(
                 note = note,
                 raw = extracted,
                 existing = store.getAllEntities().getOrDefault(emptyList()),
-                acceptedAliases = store.getAcceptedAliasMap().getOrDefault(emptyMap())
+                acceptedAliases = store.getAcceptedAliasMap().getOrDefault(emptyMap()),
+                rejectedRules = store.getRejectedKnowledgeRules().getOrDefault(emptySet())
             )
 
             // Step 4: Replace stale pending proposals for this note, then persist the
             // accepted graph and its fresh review proposals.
             store.removePendingKnowledgeReviews(note.id).getOrThrow()
+            store.removeDerivedKnowledgeForNote(note.id).getOrThrow()
             store.putNote(note, resolution.accepted, embedding).getOrThrow()
             store.putKnowledgeReviews(resolution.reviews).getOrThrow()
             val actions = ActionExtractor.toActionItems(note, extracted.actions)

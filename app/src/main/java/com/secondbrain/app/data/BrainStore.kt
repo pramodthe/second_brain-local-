@@ -118,6 +118,7 @@ class BrainStore(private val context: Context) {
 
                 knowledge.entities.forEach { entity ->
                     putAliases(d, entity.name, entity.aliases, entity.confidence, entity.sourceNoteId.ifBlank { note.id })
+                    putEntitySupport(d, entity.name, note.id, entity.evidence, entity.confidence)
                 }
 
                 // Link note to entities
@@ -130,6 +131,9 @@ class BrainStore(private val context: Context) {
                     :put note_entity {note_id, entity_name => at}
                     """.trimIndent()
                 )
+                knowledge.relations.forEach { edge ->
+                    putEdgeSupport(d, edge, note.id)
+                }
             }
 
             // 3. Store Relational Edges
@@ -178,11 +182,13 @@ class BrainStore(private val context: Context) {
         runCatching {
             val d = db ?: error("Database not open")
             if (queryVector.size != EMBEDDING_DIM) return@runCatching emptyList()
+            val trashedIds = loadTrashIds(d)
 
             val vecStr = queryVector.joinToString(", ") { it.toString() }
+            val queryK = (k + trashedIds.size).coerceAtMost(MAX_BACKUP_ITEMS)
             val query = """
                 ?[id, title, content, at, source, dist] := 
-                    ~note_vector:vec_idx{note_id: id | query: vec([$vecStr]), k: $k, ef: 64, bind_distance: dist},
+                    ~note_vector:vec_idx{note_id: id | query: vec([$vecStr]), k: $queryK, ef: 64, bind_distance: dist},
                     *note{id, title, content, at, source}
                 :order dist
             """.trimIndent()
@@ -190,7 +196,7 @@ class BrainStore(private val context: Context) {
             val rows = d.run(query)
             val modifiedTimes = loadModifiedTimes(d)
             val audioMetadata = loadAudioMetadata(d)
-            rows.map { r ->
+            rows.asSequence().filterNot { it.rows[0].asString() in trashedIds }.take(k).map { r ->
                 val id = r.rows[0].asString()
                 val createdAt = r.rows[3].asDouble()
                 val audio = audioMetadata[id]
@@ -207,7 +213,7 @@ class BrainStore(private val context: Context) {
                 )
                 val dist = r.rows[5].asFloat()
                 doc to dist
-            }
+            }.toList()
         }
     }
 
@@ -221,6 +227,13 @@ class BrainStore(private val context: Context) {
                 if (entityNames.isEmpty()) {
                     return@runCatching SubgraphContext(emptyList(), emptyList(), emptyList())
                 }
+                val trashedIds = loadTrashIds(d)
+                val activeSupportKeys = d.run(
+                    "?[source, relation, target, note_id] := *edge_support{source, relation, target, note_id}"
+                ).filterNot { it.rows[3].asString() in trashedIds }
+                    .mapTo(mutableSetOf()) {
+                        edgeKey(it.rows[0].asString(), it.rows[1].asString(), it.rows[2].asString())
+                    }
 
                 val anchors = entityNames.map { esc(it.lowercase().trim()) }.filter { it.isNotBlank() }
                 val filterClause = anchors.joinToString(" or ") { a ->
@@ -271,6 +284,9 @@ class BrainStore(private val context: Context) {
                         sourceNoteId = quality?.noteId.orEmpty(),
                         status = quality?.status ?: KnowledgeStatus.ACCEPTED
                     )
+                }.filter { edge ->
+                    val key = edgeKey(edge.source, edge.relation.name, edge.target)
+                    key in activeSupportKeys || edge.sourceNoteId.isBlank() || edge.sourceNoteId !in trashedIds
                 }
 
                 // Query 2: Entity details
@@ -286,7 +302,10 @@ class BrainStore(private val context: Context) {
                 val entityRows = d.run(entityQuery)
                 val entityQualities = loadEntityQualities(d)
                 val aliases = loadAliasesByCanonical(d)
-                val entities = entityRows.map { r ->
+                val activeEntityNames = d.run("?[note_id, entity_name] := *note_entity{note_id, entity_name}")
+                    .filterNot { it.rows[0].asString() in trashedIds }
+                    .mapTo(mutableSetOf()) { it.rows[1].asString() }
+                val entities = entityRows.filter { it.rows[0].asString() in activeEntityNames }.map { r ->
                     val name = r.rows[0].asString()
                     val quality = entityQualities[name]
                     EntityNode(
@@ -317,7 +336,7 @@ class BrainStore(private val context: Context) {
                 val noteRows = runCatching { d.run(noteQuery) }.getOrDefault(emptyList())
                 val modifiedTimes = loadModifiedTimes(d)
                 val audioMetadata = loadAudioMetadata(d)
-                val notes = noteRows.map { r ->
+                val notes = noteRows.filterNot { it.rows[0].asString() in trashedIds }.map { r ->
                     val id = r.rows[0].asString()
                     val createdAt = r.rows[3].asDouble()
                     val audio = audioMetadata[id]
@@ -347,7 +366,11 @@ class BrainStore(private val context: Context) {
             val rows = d.run("?[name, category, description, at] := *entity{name, category, description, at} :order -at")
             val qualities = loadEntityQualities(d)
             val aliases = loadAliasesByCanonical(d)
-            rows.map { r ->
+            val trashedIds = loadTrashIds(d)
+            val activeEntityNames = d.run("?[note_id, entity_name] := *note_entity{note_id, entity_name}")
+                .filterNot { it.rows[0].asString() in trashedIds }
+                .mapTo(mutableSetOf()) { it.rows[1].asString() }
+            rows.filter { row -> row.rows[0].asString() in activeEntityNames }.map { r ->
                 val name = r.rows[0].asString()
                 val quality = qualities[name]
                 EntityNode(
@@ -373,7 +396,18 @@ class BrainStore(private val context: Context) {
             val d = db ?: error("Database not open")
             val rows = d.run("?[source, relation, target, at] := *edge{source, relation, target, at} :order -at")
             val qualities = loadEdgeQualities(d)
-            rows.map { r ->
+            val trashedIds = loadTrashIds(d)
+            val activeSupportKeys = d.run(
+                "?[source, relation, target, note_id] := *edge_support{source, relation, target, note_id}"
+            ).filterNot { it.rows[3].asString() in trashedIds }
+                .mapTo(mutableSetOf()) {
+                    edgeKey(it.rows[0].asString(), it.rows[1].asString(), it.rows[2].asString())
+                }
+            rows.filter { row ->
+                val key = edgeKey(row.rows[0].asString(), row.rows[1].asString(), row.rows[2].asString())
+                val sourceNoteId = qualities[key]?.noteId.orEmpty()
+                key in activeSupportKeys || sourceNoteId.isBlank() || sourceNoteId !in trashedIds
+            }.map { r ->
                 val source = r.rows[0].asString()
                 val relation = RelationType.fromString(r.rows[1].asString())
                 val target = r.rows[2].asString()
@@ -396,7 +430,9 @@ class BrainStore(private val context: Context) {
     suspend fun getNoteEntityNames(): Result<Map<String, Set<String>>> = withContext(Dispatchers.IO) {
         runCatching {
             val d = db ?: error("Database not open")
+            val trashedIds = loadTrashIds(d)
             d.run("?[note_id, entity_name] := *note_entity{note_id, entity_name}")
+                .filterNot { it.rows[0].asString() in trashedIds }
                 .groupBy(
                     keySelector = { it.rows[0].asString() },
                     valueTransform = { it.rows[1].asString() }
@@ -411,10 +447,13 @@ class BrainStore(private val context: Context) {
     suspend fun getRecentNotes(limit: Int = 20): Result<List<NoteDocument>> = withContext(Dispatchers.IO) {
         runCatching {
             val d = db ?: error("Database not open")
-            val rows = d.run("?[id, title, content, at, source] := *note{id, title, content, at, source} :order -at :limit $limit")
+            val trashedIds = loadTrashIds(d)
+            val queryLimit = (limit.coerceIn(1, MAX_BACKUP_ITEMS) + trashedIds.size)
+                .coerceAtMost(MAX_BACKUP_ITEMS)
+            val rows = d.run("?[id, title, content, at, source] := *note{id, title, content, at, source} :order -at :limit $queryLimit")
             val modifiedTimes = loadModifiedTimes(d)
             val audioMetadata = loadAudioMetadata(d)
-            rows.map { r ->
+            rows.asSequence().filterNot { it.rows[0].asString() in trashedIds }.take(limit).map { r ->
                 val id = r.rows[0].asString()
                 val createdAt = r.rows[3].asDouble()
                 val audio = audioMetadata[id]
@@ -429,11 +468,144 @@ class BrainStore(private val context: Context) {
                     audioDurationMs = audio?.durationMs,
                     transcriptionStatus = audio?.status ?: TranscriptionStatus.NONE
                 )
-            }
+            }.toList()
         }
     }
 
     suspend fun getAllNotes(): Result<List<NoteDocument>> = getRecentNotes(limit = 100_000)
+
+    suspend fun getTrashedNotes(limit: Int = 1_000): Result<List<TrashedNote>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            val rows = d.run(
+                """
+                ?[id, title, content, at, source, deleted_at] :=
+                    *note_trash{note_id: id, deleted_at},
+                    *note{id, title, content, at, source}
+                :order -deleted_at
+                :limit ${limit.coerceIn(1, MAX_BACKUP_ITEMS)}
+                """.trimIndent()
+            )
+            val modifiedTimes = loadModifiedTimes(d)
+            val audioMetadata = loadAudioMetadata(d)
+            rows.map { row ->
+                val id = row.rows[0].asString()
+                val createdAt = row.rows[3].asDouble()
+                val audio = audioMetadata[id]
+                TrashedNote(
+                    note = NoteDocument(
+                        id = id,
+                        title = row.rows[1].asString(),
+                        content = row.rows[2].asString(),
+                        timestamp = createdAt,
+                        source = row.rows[4].asString(),
+                        modifiedTimestamp = modifiedTimes[id] ?: createdAt,
+                        audioPath = audio?.path,
+                        audioDurationMs = audio?.durationMs,
+                        transcriptionStatus = audio?.status ?: TranscriptionStatus.NONE
+                    ),
+                    deletedTimestamp = row.rows[5].asDouble()
+                )
+            }
+        }
+    }
+
+    suspend fun moveNoteToTrash(noteId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            check(noteExists(d, noteId)) { "Note not found" }
+            d.run(
+                """
+                ?[note_id, deleted_at] <- [["${esc(noteId)}", ${now()}]]
+                :put note_trash {note_id => deleted_at}
+                """.trimIndent()
+            )
+            cancelJobsForNote(d, noteId, "Note moved to Trash")
+            Unit
+        }
+    }
+
+    suspend fun restoreNote(noteId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            check(noteExists(d, noteId)) { "Note not found" }
+            d.run(
+                """
+                ?[note_id] <- [["${esc(noteId)}"]]
+                :rm note_trash {note_id}
+                """.trimIndent()
+            )
+            Unit
+        }
+    }
+
+    suspend fun permanentlyDeleteNote(noteId: String): Result<PermanentDeleteReport> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            check(noteId in loadTrashIds(d)) { "Move the note to Trash before deleting it forever" }
+            val audioPath = loadAudioMetadata(d)[noteId]?.path
+            val actionIds = queryActionItems(d, noteId = noteId).map(ActionItem::id)
+            val reviewIds = d.run(
+                """
+                ?[id] := *review_item{id, note_id}, note_id == "${esc(noteId)}"
+                """.trimIndent()
+            ).map { it.rows[0].asString() }
+            val jobIds = d.run(
+                """
+                ?[id] := *processing_job{id, note_id}, note_id == "${esc(noteId)}"
+                """.trimIndent()
+            ).map { it.rows[0].asString() }
+
+            actionIds.forEach { removeAction(d, it) }
+            reviewIds.forEach { removeReview(d, it) }
+            jobIds.forEach { removeProcessingJob(d, it) }
+            val (entitiesRemoved, edgesRemoved) = cleanupDerivedKnowledgeForNote(d, noteId)
+            removeBySingleKey(d, "note_audio", "note_id", noteId)
+            removeBySingleKey(d, "note_meta", "note_id", noteId)
+            removeBySingleKey(d, "note_trash", "note_id", noteId)
+            removeBySingleKey(d, "note", "id", noteId)
+            val recordingRemoved = audioPath?.let { path ->
+                val file = File(path)
+                !file.exists() || file.delete()
+            } ?: false
+            PermanentDeleteReport(
+                noteId = noteId,
+                actionsRemoved = actionIds.size,
+                reviewsRemoved = reviewIds.size,
+                jobsRemoved = jobIds.size,
+                unsupportedEntitiesRemoved = entitiesRemoved,
+                unsupportedEdgesRemoved = edgesRemoved,
+                recordingRemoved = recordingRemoved
+            )
+        }
+    }
+
+    /** Clears stale graph/vector output before an edited note is organized again. */
+    suspend fun removeDerivedKnowledgeForNote(noteId: String): Result<Pair<Int, Int>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            cleanupDerivedKnowledgeForNote(d, noteId)
+        }
+    }
+
+    suspend fun recordAgentAudit(
+        tool: String,
+        targetId: String,
+        summary: String,
+        status: String = "SUCCEEDED"
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            val id = "audit-${java.util.UUID.randomUUID()}"
+            d.run(
+                """
+                ?[id, tool, target_id, summary, status, at] <- [["$id", "${esc(tool)}", "${esc(targetId)}", "${esc(summary)}", "${esc(status)}", ${now()}]]
+                :put agent_audit {id => tool, target_id, summary, status, at}
+                """.trimIndent()
+            )
+            Unit
+        }
+    }
 
     /** Merges portable graph records without deleting any local rows. */
     suspend fun restoreGraph(
@@ -454,9 +626,13 @@ class BrainStore(private val context: Context) {
         }
     }
 
-    suspend fun getNote(noteId: String): Result<NoteDocument?> = withContext(Dispatchers.IO) {
+    suspend fun getNote(
+        noteId: String,
+        includeTrashed: Boolean = false
+    ): Result<NoteDocument?> = withContext(Dispatchers.IO) {
         runCatching {
             val d = db ?: error("Database not open")
+            if (!includeTrashed && noteId in loadTrashIds(d)) return@runCatching null
             val rows = d.run(
                 """
                 ?[id, title, content, at, source] := *note{id, title, content, at, source}, id == "${esc(noteId)}"
@@ -517,6 +693,7 @@ class BrainStore(private val context: Context) {
         runCatching {
             val d = db ?: error("Database not open")
             val statusFilter = status?.let { ", status == \"${it.name}\"" }.orEmpty()
+            val trashedIds = loadTrashIds(d)
             d.run(
                 """
                 ?[id, kind, status, note_id, subject, candidate, schema_type, description, aliases, confidence, evidence, created_at, updated_at] :=
@@ -524,7 +701,7 @@ class BrainStore(private val context: Context) {
                 :order -updated_at
                 :limit ${limit.coerceIn(1, MAX_BACKUP_ITEMS)}
                 """.trimIndent()
-            ).map(::knowledgeReviewFromRow)
+            ).filterNot { it.rows[3].asString() in trashedIds }.map(::knowledgeReviewFromRow)
         }
     }
 
@@ -568,6 +745,7 @@ class BrainStore(private val context: Context) {
                         val canonical = item.candidate.ifBlank { item.subject }
                         putAliases(d, canonical, listOf(item.subject) + item.aliases, item.confidence, item.noteId)
                         linkNoteEntity(d, item.noteId, canonical)
+                        putEntitySupport(d, canonical, item.noteId, item.evidence, item.confidence)
                     }
 
                     ReviewKind.RELATION -> {
@@ -600,7 +778,28 @@ class BrainStore(private val context: Context) {
                     )
                 )
             ).getOrThrow()
+            val fingerprint = KnowledgeFeedbackKey.of(item.kind, item.subject, item.candidate, item.schemaType)
+            d.run(
+                """
+                ?[fingerprint, kind, decision, subject, candidate, schema_type, at] <- [[
+                    "${esc(fingerprint)}", "${item.kind.name}", "${if (accept) "ACCEPTED" else "REJECTED"}",
+                    "${esc(item.subject)}", "${esc(item.candidate)}", "${esc(item.schemaType)}", ${now()}
+                ]]
+                :put knowledge_feedback {fingerprint => kind, decision, subject, candidate, schema_type, at}
+                """.trimIndent()
+            )
             Unit
+        }
+    }
+
+    suspend fun getRejectedKnowledgeRules(): Result<Set<String>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            d.run(
+                """
+                ?[fingerprint] := *knowledge_feedback{fingerprint, decision}, decision == "REJECTED"
+                """.trimIndent()
+            ).mapTo(mutableSetOf()) { it.rows[0].asString() }
         }
     }
 
@@ -650,7 +849,9 @@ class BrainStore(private val context: Context) {
     ): Result<List<ActionItem>> = withContext(Dispatchers.IO) {
         runCatching {
             val d = db ?: error("Database not open")
+            val trashedIds = loadTrashIds(d)
             queryActionItems(d, status = status, limit = limit)
+                .filter { it.noteId.isBlank() || it.noteId !in trashedIds }
                 .sortedWith(
                     compareBy<ActionItem> { it.dueTimestamp ?: Double.MAX_VALUE }
                         .thenByDescending(ActionItem::updatedTimestamp)
@@ -661,7 +862,9 @@ class BrainStore(private val context: Context) {
     suspend fun getActionItem(id: String): Result<ActionItem?> = withContext(Dispatchers.IO) {
         runCatching {
             val d = db ?: error("Database not open")
-            queryActionItems(d, id = id, limit = 1).firstOrNull()
+            val trashedIds = loadTrashIds(d)
+            queryActionItems(d, id = id, limit = 1)
+                .firstOrNull { it.noteId.isBlank() || it.noteId !in trashedIds }
         }
     }
 
@@ -917,29 +1120,34 @@ class BrainStore(private val context: Context) {
     suspend fun getProcessingJobs(limit: Int = 100): Result<List<ProcessingJob>> = withContext(Dispatchers.IO) {
         runCatching {
             val d = db ?: error("Database not open")
+            val trashedIds = loadTrashIds(d)
             d.run(
                 """
                 ?[id, note_id, type, status, progress, message, error, attempt, created_at, updated_at] :=
                     *processing_job{id, note_id, type, status, progress, message, error, attempt, created_at, updated_at}
                 :order -updated_at
-                :limit ${limit.coerceIn(1, 500)}
+                :limit 500
                 """.trimIndent()
             ).map(::processingJobFromRow)
+                .filterNot { it.noteId in trashedIds }
+                .take(limit.coerceIn(1, 500))
         }
     }
 
     suspend fun getNextQueuedProcessingJob(): Result<ProcessingJob?> = withContext(Dispatchers.IO) {
         runCatching {
             val d = db ?: error("Database not open")
+            val trashedIds = loadTrashIds(d)
             d.run(
                 """
                 ?[id, note_id, type, status, progress, message, error, attempt, created_at, updated_at] :=
                     *processing_job{id, note_id, type, status, progress, message, error, attempt, created_at, updated_at},
                     status == "${ProcessingJobStatus.QUEUED.name}"
                 :order created_at
-                :limit 1
+                :limit 500
                 """.trimIndent()
-            ).firstOrNull()?.let(::processingJobFromRow)
+            ).map(::processingJobFromRow)
+                .firstOrNull { it.noteId !in trashedIds }
         }
     }
 
@@ -1044,6 +1252,9 @@ class BrainStore(private val context: Context) {
             """.trimIndent()
         )
         putAliases(d, entity.name, entity.aliases, entity.confidence, noteId)
+        if (noteId.isNotBlank()) {
+            putEntitySupport(d, entity.name, noteId, entity.evidence, entity.confidence)
+        }
     }
 
     private fun putEdge(d: CozoDb, edge: RelationEdge) {
@@ -1057,6 +1268,33 @@ class BrainStore(private val context: Context) {
             """
             ?[source, relation, target, confidence, status, evidence, note_id] <- [["${esc(edge.source)}", "${edge.relation.name}", "${esc(edge.target)}", ${edge.confidence.coerceIn(0.0, 1.0)}, "${KnowledgeStatus.ACCEPTED.name}", "${esc(edge.evidence)}", "${esc(edge.sourceNoteId)}"]]
             :put edge_quality {source, relation, target => confidence, status, evidence, note_id}
+            """.trimIndent()
+        )
+        if (edge.sourceNoteId.isNotBlank()) {
+            putEdgeSupport(d, edge, edge.sourceNoteId)
+        }
+    }
+
+    private fun putEntitySupport(
+        d: CozoDb,
+        entityName: String,
+        noteId: String,
+        evidence: String,
+        confidence: Double
+    ) {
+        d.run(
+            """
+            ?[entity_name, note_id, evidence, confidence, at] <- [["${esc(entityName)}", "${esc(noteId)}", "${esc(evidence)}", ${confidence.coerceIn(0.0, 1.0)}, ${now()}]]
+            :put entity_support {entity_name, note_id => evidence, confidence, at}
+            """.trimIndent()
+        )
+    }
+
+    private fun putEdgeSupport(d: CozoDb, edge: RelationEdge, noteId: String) {
+        d.run(
+            """
+            ?[source, relation, target, note_id, evidence, confidence, at] <- [["${esc(edge.source)}", "${edge.relation.name}", "${esc(edge.target)}", "${esc(noteId)}", "${esc(edge.evidence)}", ${edge.confidence.coerceIn(0.0, 1.0)}, ${now()}]]
+            :put edge_support {source, relation, target, note_id => evidence, confidence, at}
             """.trimIndent()
         )
     }
@@ -1157,6 +1395,194 @@ class BrainStore(private val context: Context) {
     private fun edgeKey(source: String, relation: String, target: String): String =
         "${normalizeEntityName(source)}|${relation.uppercase()}|${normalizeEntityName(target)}"
 
+    private fun noteExists(d: CozoDb, noteId: String): Boolean = d.run(
+        """
+        ?[id] := *note{id}, id == "${esc(noteId)}"
+        :limit 1
+        """.trimIndent()
+    ).isNotEmpty()
+
+    private fun loadTrashIds(d: CozoDb): Set<String> = runCatching {
+        d.run("?[note_id] := *note_trash{note_id}")
+            .mapTo(mutableSetOf()) { it.rows[0].asString() }
+    }.getOrDefault(emptySet())
+
+    private fun removeBySingleKey(d: CozoDb, relation: String, key: String, value: String) {
+        d.run(
+            """
+            ?[$key] <- [["${esc(value)}"]]
+            :rm $relation {$key}
+            """.trimIndent()
+        )
+    }
+
+    private fun removeProcessingJob(d: CozoDb, id: String) {
+        removeBySingleKey(d, "processing_job", "id", id)
+    }
+
+    private fun cancelJobsForNote(d: CozoDb, noteId: String, message: String) {
+        d.run(
+            """
+            ?[id, note_id, type, status, progress, message, error, attempt, created_at, updated_at] :=
+                *processing_job{id, note_id, type, status: old_status, progress, message: old_message, error, attempt, created_at, updated_at: old_updated},
+                note_id == "${esc(noteId)}",
+                status = "${ProcessingJobStatus.CANCELLED.name}",
+                message = "${esc(message)}",
+                updated_at = ${now()}
+            :put processing_job {id => note_id, type, status, progress, message, error, attempt, created_at, updated_at}
+            """.trimIndent()
+        )
+    }
+
+    /** Returns counts of graph records that lost their final source. */
+    private fun cleanupDerivedKnowledgeForNote(d: CozoDb, noteId: String): Pair<Int, Int> {
+        val linkedEntities = d.run(
+            """
+            ?[entity_name] := *note_entity{note_id, entity_name}, note_id == "${esc(noteId)}"
+            """.trimIndent()
+        ).map { it.rows[0].asString() }.distinct()
+        val supportedEdges = buildList {
+            addAll(
+                d.run(
+                    """
+                    ?[source, relation, target] := *edge_support{source, relation, target, note_id}, note_id == "${esc(noteId)}"
+                    """.trimIndent()
+                ).map { Triple(it.rows[0].asString(), it.rows[1].asString(), it.rows[2].asString()) }
+            )
+            addAll(
+                d.run(
+                    """
+                    ?[source, relation, target] := *edge_quality{source, relation, target, note_id}, note_id == "${esc(noteId)}"
+                    """.trimIndent()
+                ).map { Triple(it.rows[0].asString(), it.rows[1].asString(), it.rows[2].asString()) }
+            )
+        }.distinct()
+
+        d.run(
+            """
+            ?[note_id, entity_name] := *note_entity{note_id, entity_name}, note_id == "${esc(noteId)}"
+            :rm note_entity {note_id, entity_name}
+            """.trimIndent()
+        )
+        d.run(
+            """
+            ?[entity_name, note_id] := *entity_support{entity_name, note_id}, note_id == "${esc(noteId)}"
+            :rm entity_support {entity_name, note_id}
+            """.trimIndent()
+        )
+        d.run(
+            """
+            ?[source, relation, target, note_id] := *edge_support{source, relation, target, note_id}, note_id == "${esc(noteId)}"
+            :rm edge_support {source, relation, target, note_id}
+            """.trimIndent()
+        )
+        removeBySingleKey(d, "note_vector", "note_id", noteId)
+
+        var edgesRemoved = 0
+        supportedEdges.forEach { (source, relation, target) ->
+            val remainingSupport = d.run(
+                """
+                ?[note_id, evidence, confidence] :=
+                    *edge_support{source, relation, target, note_id, evidence, confidence},
+                    source == "${esc(source)}",
+                    relation == "${esc(relation)}",
+                    target == "${esc(target)}"
+                :limit 1
+                """.trimIndent()
+            ).firstOrNull()
+            val qualityBelongsToNote = d.run(
+                """
+                ?[note_id] := *edge_quality{source, relation, target, note_id},
+                    source == "${esc(source)}",
+                    relation == "${esc(relation)}",
+                    target == "${esc(target)}",
+                    note_id == "${esc(noteId)}"
+                :limit 1
+                """.trimIndent()
+            ).isNotEmpty()
+            if (remainingSupport != null && qualityBelongsToNote) {
+                d.run(
+                    """
+                    ?[source, relation, target, confidence, status, evidence, note_id] <- [[
+                        "${esc(source)}", "${esc(relation)}", "${esc(target)}",
+                        ${remainingSupport.rows[2].asDouble()}, "${KnowledgeStatus.ACCEPTED.name}",
+                        "${esc(remainingSupport.rows[1].asString())}", "${esc(remainingSupport.rows[0].asString())}"
+                    ]]
+                    :put edge_quality {source, relation, target => confidence, status, evidence, note_id}
+                    """.trimIndent()
+                )
+            } else if (remainingSupport == null && qualityBelongsToNote) {
+                removeEdgeRecord(d, source, relation, target)
+                edgesRemoved++
+            }
+        }
+
+        var entitiesRemoved = 0
+        linkedEntities.forEach { entityName ->
+            val remainingNote = d.run(
+                """
+                ?[note_id] := *note_entity{note_id, entity_name}, entity_name == "${esc(entityName)}"
+                :limit 1
+                """.trimIndent()
+            ).firstOrNull()?.rows?.get(0)?.asString()
+            if (remainingNote == null) {
+                removeEntityRecord(d, entityName)
+                entitiesRemoved++
+            } else {
+                val quality = loadEntityQualities(d)[entityName]
+                if (quality?.noteId == noteId) {
+                    d.run(
+                        """
+                        ?[name, confidence, status, evidence, note_id] <- [[
+                            "${esc(entityName)}", ${quality.confidence}, "${quality.status.name}",
+                            "${esc(quality.evidence)}", "${esc(remainingNote)}"
+                        ]]
+                        :put entity_quality {name => confidence, status, evidence, note_id}
+                        """.trimIndent()
+                    )
+                }
+            }
+        }
+        return entitiesRemoved to edgesRemoved
+    }
+
+    private fun removeEdgeRecord(d: CozoDb, sourceValue: String, relationValue: String, targetValue: String) {
+        val values = "[\"${esc(sourceValue)}\", \"${esc(relationValue)}\", \"${esc(targetValue)}\"]"
+        d.run("?[source, relation, target] <- [$values]\n:rm edge {source, relation, target}")
+        d.run("?[source, relation, target] <- [$values]\n:rm edge_quality {source, relation, target}")
+        d.run(
+            """
+            ?[source, relation, target, note_id] := *edge_support{source, relation, target, note_id},
+                source == "${esc(sourceValue)}", relation == "${esc(relationValue)}", target == "${esc(targetValue)}"
+            :rm edge_support {source, relation, target, note_id}
+            """.trimIndent()
+        )
+    }
+
+    private fun removeEntityRecord(d: CozoDb, entityName: String) {
+        removeBySingleKey(d, "entity", "name", entityName)
+        removeBySingleKey(d, "entity_quality", "name", entityName)
+        d.run(
+            """
+            ?[entity_name, note_id] := *entity_support{entity_name, note_id}, entity_name == "${esc(entityName)}"
+            :rm entity_support {entity_name, note_id}
+            """.trimIndent()
+        )
+        d.run(
+            """
+            ?[alias] := *entity_alias{alias, canonical_name}, canonical_name == "${esc(entityName)}"
+            :rm entity_alias {alias}
+            """.trimIndent()
+        )
+        val touchingEdges = d.run(
+            """
+            ?[source, relation, target] := *edge{source, relation, target},
+                source == "${esc(entityName)}" or target == "${esc(entityName)}"
+            """.trimIndent()
+        ).map { Triple(it.rows[0].asString(), it.rows[1].asString(), it.rows[2].asString()) }
+        touchingEdges.forEach { (source, relation, target) -> removeEdgeRecord(d, source, relation, target) }
+    }
+
     private fun normalizeEntityName(value: String): String = value
         .lowercase()
         .replace(Regex("[^a-z0-9]+"), " ")
@@ -1182,14 +1608,23 @@ class BrainStore(private val context: Context) {
 
     suspend fun getStats(): Map<String, Int> = withContext(Dispatchers.IO) {
         val d = db ?: return@withContext emptyMap()
-        val noteCount = runCatching { d.run("?[count(id)] := *note{id}").firstOrNull()?.rows?.get(0)?.asInteger() ?: 0 }.getOrDefault(0)
-        val entityCount = runCatching { d.run("?[count(name)] := *entity{name}").firstOrNull()?.rows?.get(0)?.asInteger() ?: 0 }.getOrDefault(0)
-        val edgeCount = runCatching { d.run("?[count(source)] := *edge{source, relation, target}").firstOrNull()?.rows?.get(0)?.asInteger() ?: 0 }.getOrDefault(0)
+        val trashIds = loadTrashIds(d)
+        val noteCount = runCatching {
+            d.run("?[id] := *note{id}").count { it.rows[0].asString() !in trashIds }
+        }.getOrDefault(0)
+        val entityCount = getAllEntities().getOrDefault(emptyList()).size
+        val edgeCount = getAllEdges().getOrDefault(emptyList()).size
         val reviewCount = runCatching {
             d.run("?[count(id)] := *review_item{id, status}, status == \"${ReviewStatus.PENDING.name}\"")
                 .firstOrNull()?.rows?.get(0)?.asInteger() ?: 0
         }.getOrDefault(0)
-        mapOf("notes" to noteCount, "entities" to entityCount, "edges" to edgeCount, "reviews" to reviewCount)
+        mapOf(
+            "notes" to noteCount,
+            "trash" to trashIds.size,
+            "entities" to entityCount,
+            "edges" to edgeCount,
+            "reviews" to reviewCount
+        )
     }
 
     fun close() {
@@ -1206,14 +1641,19 @@ class BrainStore(private val context: Context) {
             ":create note {id: String => title: String, content: String, at: Float, source: String}",
             ":create note_meta {note_id: String => modified_at: Float}",
             ":create note_audio {note_id: String => path: String, duration_ms: Int, status: String}",
+            ":create note_trash {note_id: String => deleted_at: Float}",
             ":create processing_job {id: String => note_id: String, type: String, status: String, progress: Int, message: String, error: String, attempt: Int, created_at: Float, updated_at: Float}",
             ":create entity {name: String => category: String, description: String, at: Float}",
             ":create entity_quality {name: String => confidence: Float, status: String, evidence: String, note_id: String}",
+            ":create entity_support {entity_name: String, note_id: String => evidence: String, confidence: Float, at: Float}",
             ":create entity_alias {alias: String => canonical_name: String, confidence: Float, status: String, note_id: String, at: Float}",
             ":create edge {source: String, relation: String, target: String => at: Float}",
             ":create edge_quality {source: String, relation: String, target: String => confidence: Float, status: String, evidence: String, note_id: String}",
+            ":create edge_support {source: String, relation: String, target: String, note_id: String => evidence: String, confidence: Float, at: Float}",
             ":create note_entity {note_id: String, entity_name: String => at: Float}",
             ":create review_item {id: String => kind: String, status: String, note_id: String, subject: String, candidate: String, schema_type: String, description: String, aliases: String, confidence: Float, evidence: String, created_at: Float, updated_at: Float}",
+            ":create knowledge_feedback {fingerprint: String => kind: String, decision: String, subject: String, candidate: String, schema_type: String, at: Float}",
+            ":create agent_audit {id: String => tool: String, target_id: String, summary: String, status: String, at: Float}",
             ":create action_item {id: String => note_id: String, text: String, due_at: Float, status: String, confidence: Float, evidence: String, created_at: Float, updated_at: Float}",
             ":create action_override {id: String => text: String, due_at: Float, updated_at: Float}",
             ":create action_reminder {action_id: String => due_at: Float, notified_at: Float}",

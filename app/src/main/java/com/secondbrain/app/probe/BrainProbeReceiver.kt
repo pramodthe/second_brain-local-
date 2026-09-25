@@ -15,7 +15,13 @@ import com.secondbrain.app.ai.SpeechEngine
 import com.secondbrain.app.data.ActionItem
 import com.secondbrain.app.data.ActionStatus
 import com.secondbrain.app.data.BrainStore
+import com.secondbrain.app.data.EntityCategory
+import com.secondbrain.app.data.EntityNode
+import com.secondbrain.app.data.ExtractedKnowledge
+import com.secondbrain.app.data.NoteDocument
 import com.secondbrain.app.data.ProcessingJobType
+import com.secondbrain.app.data.RelationEdge
+import com.secondbrain.app.data.RelationType
 import com.secondbrain.app.domain.HybridRetriever
 import com.secondbrain.app.domain.IngestionPipeline
 import com.secondbrain.app.work.ProcessingWorkScheduler
@@ -47,6 +53,8 @@ class BrainProbeReceiver : BroadcastReceiver() {
                     runActionsDiagnostic(context.applicationContext)
                 } else if (intent?.getBooleanExtra(EXTRA_REMINDERS_ONLY, false) == true) {
                     runReminderDiagnostic(context.applicationContext)
+                } else if (intent?.getBooleanExtra(EXTRA_CRUD_ONLY, false) == true) {
+                    runCrudDiagnostic(context.applicationContext)
                 } else {
                     runDiagnostic(context.applicationContext)
                 }
@@ -56,6 +64,90 @@ class BrainProbeReceiver : BroadcastReceiver() {
                 pending.finish()
             }
         }
+    }
+
+    private suspend fun runCrudDiagnostic(context: Context) {
+        Log.i(TAG, "================== START CRUD PROBE ==================")
+        val store = BrainStore(context)
+        val note = NoteDocument(
+            id = CRUD_PROBE_NOTE_ID,
+            title = "CRUD probe note",
+            content = "CRUD Probe Project uses CRUD Probe Concept.",
+            source = "probe"
+        )
+        val project = EntityNode(
+            name = "CRUD Probe Project",
+            category = EntityCategory.PROJECT,
+            evidence = "CRUD Probe Project",
+            sourceNoteId = note.id
+        )
+        val concept = EntityNode(
+            name = "CRUD Probe Concept",
+            category = EntityCategory.CONCEPT,
+            evidence = "CRUD Probe Concept",
+            sourceNoteId = note.id
+        )
+        val relation = RelationEdge(
+            source = project.name,
+            relation = RelationType.USES_CONCEPT,
+            target = concept.name,
+            evidence = note.content,
+            sourceNoteId = note.id
+        )
+        val action = ActionItem(
+            id = ActionItem.stableId(note.id, "Verify CRUD cleanup"),
+            noteId = note.id,
+            text = "Verify CRUD cleanup",
+            confidence = 1.0,
+            evidence = note.content
+        )
+        try {
+            store.open().getOrThrow()
+            store.putNote(
+                note,
+                ExtractedKnowledge(listOf(project, concept), listOf(relation)),
+                FloatArray(BrainStore.EMBEDDING_DIM) { if (it == 0) 1f else 0f }
+            ).getOrThrow()
+            store.syncOpenActionItems(note.id, listOf(action)).getOrThrow()
+            val job = store.enqueueProcessingJob(note.id, ProcessingJobType.ORGANIZE).getOrThrow()
+            check(store.getNote(note.id).getOrThrow() != null) { "Created note was not readable" }
+
+            store.moveNoteToTrash(note.id).getOrThrow()
+            check(store.getNote(note.id).getOrThrow() == null) { "Trashed note remained active" }
+            check(store.getTrashedNotes().getOrThrow().any { it.note.id == note.id }) { "Trash entry was not stored" }
+            check(store.getActionItems().getOrThrow().none { it.id == action.id }) { "Trashed action remained active" }
+            check(store.getAllEntities().getOrThrow().none { it.name == project.name }) { "Trashed entity remained active" }
+            check(store.getProcessingJobs().getOrThrow().none { it.id == job.id }) { "Trashed job remained visible" }
+            check(store.getProcessingJob(job.id).getOrThrow()?.status?.name == "CANCELLED") {
+                "Trashed job was not cancelled"
+            }
+
+            store.restoreNote(note.id).getOrThrow()
+            check(store.getNote(note.id).getOrThrow() != null) { "Restored note was not readable" }
+            check(store.getActionItems().getOrThrow().any { it.id == action.id }) { "Restored action did not return" }
+
+            store.moveNoteToTrash(note.id).getOrThrow()
+            val report = store.permanentlyDeleteNote(note.id).getOrThrow()
+            check(store.getTrashedNotes().getOrThrow().none { it.note.id == note.id }) { "Permanent delete left a trash row" }
+            check(store.getAllEntities().getOrThrow().none { it.name in setOf(project.name, concept.name) }) {
+                "Permanent delete left unsupported entities"
+            }
+            check(report.actionsRemoved == 1 && report.jobsRemoved == 1 && report.unsupportedEntitiesRemoved == 2) {
+                "Unexpected cleanup report: $report"
+            }
+            Log.i(TAG, "CRUD PASS: create, read, trash, restore, cascade delete, and graph cleanup succeeded")
+        } catch (error: Throwable) {
+            Log.e(TAG, "CRUD FAIL: ${error.message}", error)
+        } finally {
+            runCatching {
+                if (store.getNote(note.id).getOrNull() != null) store.moveNoteToTrash(note.id).getOrThrow()
+                if (store.getTrashedNotes().getOrDefault(emptyList()).any { it.note.id == note.id }) {
+                    store.permanentlyDeleteNote(note.id).getOrThrow()
+                }
+            }
+            store.close()
+        }
+        Log.i(TAG, "================== CRUD PROBE COMPLETE ==================")
     }
 
     private suspend fun runReminderDiagnostic(context: Context) {
@@ -332,7 +424,9 @@ class BrainProbeReceiver : BroadcastReceiver() {
         private const val EXTRA_RETRIEVAL_ONLY = "retrieval_only"
         private const val EXTRA_ACTIONS_ONLY = "actions_only"
         private const val EXTRA_REMINDERS_ONLY = "reminders_only"
+        private const val EXTRA_CRUD_ONLY = "crud_only"
         private const val ACTION_PROBE_NOTE_ID = "probe-action-storage"
         private const val REMINDER_PROBE_NOTE_ID = "probe-action-reminder"
+        private const val CRUD_PROBE_NOTE_ID = "probe-agent-crud"
     }
 }

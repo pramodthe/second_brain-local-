@@ -58,6 +58,7 @@ import com.secondbrain.app.data.ProcessingJobType
 import com.secondbrain.app.data.RelationEdge
 import com.secondbrain.app.data.RetrievedSource
 import com.secondbrain.app.data.TranscriptionStatus
+import com.secondbrain.app.data.TrashedNote
 import com.secondbrain.app.domain.DailyReview
 import androidx.core.content.ContextCompat
 import java.text.DateFormat
@@ -1187,6 +1188,7 @@ fun NotesScreen(
     onEditNote: (NoteDocument) -> Unit
 ) {
     val notes by viewModel.notes.collectAsState()
+    val trashedNotes by viewModel.trashedNotes.collectAsState()
     val stats by viewModel.stats.collectAsState()
     val processingNoteIds by viewModel.processingNoteIds.collectAsState()
     val speechProcessingNoteIds by viewModel.speechProcessingNoteIds.collectAsState()
@@ -1198,6 +1200,7 @@ fun NotesScreen(
     val isLoadingRelatedNotes by viewModel.isLoadingRelatedNotes.collectAsState()
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var notesMode by rememberSaveable { mutableStateOf(NotesMode.RECENT) }
+    var permanentlyDelete by remember { mutableStateOf<NoteDocument?>(null) }
 
     LaunchedEffect(searchQuery) {
         viewModel.searchNotes(searchQuery)
@@ -1250,6 +1253,12 @@ fun NotesScreen(
                     leadingIcon = { Icon(Icons.Default.Timeline, null, Modifier.size(18.dp)) },
                     label = { Text("Timeline") }
                 )
+                FilterChip(
+                    selected = notesMode == NotesMode.TRASH,
+                    onClick = { notesMode = NotesMode.TRASH },
+                    leadingIcon = { Icon(Icons.Default.DeleteOutline, null, Modifier.size(18.dp)) },
+                    label = { Text("Trash") }
+                )
             }
         }
 
@@ -1274,6 +1283,7 @@ fun NotesScreen(
                     Text(
                         when {
                             searchQuery.isNotBlank() -> "Smart search results"
+                            notesMode == NotesMode.TRASH -> "Trash"
                             notesMode == NotesMode.TIMELINE -> "Knowledge timeline"
                             else -> "Recent notes"
                         },
@@ -1281,7 +1291,11 @@ fun NotesScreen(
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        "${visibleNotes.size} ${if (visibleNotes.size == 1) "note" else "notes"}",
+                        if (notesMode == NotesMode.TRASH && searchQuery.isBlank()) {
+                            "${trashedNotes.size} ${if (trashedNotes.size == 1) "deleted note" else "deleted notes"}"
+                        } else {
+                            "${visibleNotes.size} ${if (visibleNotes.size == 1) "note" else "notes"}"
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -1290,7 +1304,21 @@ fun NotesScreen(
             }
         }
 
-        if (visibleNotes.isEmpty() && !isSearchingNotes) {
+        if (searchQuery.isBlank() && notesMode == NotesMode.TRASH) {
+            if (trashedNotes.isEmpty()) {
+                item {
+                    EmptyTrashState()
+                }
+            } else {
+                items(trashedNotes, key = { "trash-${it.note.id}" }) { trashed ->
+                    TrashedNoteCard(
+                        item = trashed,
+                        onRestore = { viewModel.restoreNote(trashed.note) },
+                        onDeleteForever = { permanentlyDelete = trashed.note }
+                    )
+                }
+            }
+        } else if (visibleNotes.isEmpty() && !isSearchingNotes) {
             item { EmptyNotesState(searchQuery.isNotBlank(), onNewNote) }
         } else if (searchQuery.isBlank() && notesMode == NotesMode.TIMELINE) {
             notes.groupBy(::timelineDayLabel).forEach { (day, dayNotes) ->
@@ -1303,6 +1331,7 @@ fun NotesScreen(
                         isPlaying = note.id == playingNoteId,
                         onOpen = { onEditNote(note) },
                         onRelated = { viewModel.showRelatedNotes(note) },
+                        onTrash = { viewModel.moveNoteToTrash(note) },
                         onTogglePlayback = { viewModel.togglePlayback(note) },
                         onRetryTranscription = { viewModel.retryTranscription(note) }
                     )
@@ -1318,6 +1347,7 @@ fun NotesScreen(
                     isPlaying = note.id == playingNoteId,
                     onOpen = { onEditNote(note) },
                     onRelated = { viewModel.showRelatedNotes(note) },
+                    onTrash = { viewModel.moveNoteToTrash(note) },
                     onTogglePlayback = { viewModel.togglePlayback(note) },
                     onRetryTranscription = { viewModel.retryTranscription(note) }
                 )
@@ -1337,9 +1367,33 @@ fun NotesScreen(
             }
         )
     }
+
+    permanentlyDelete?.let { note ->
+        AlertDialog(
+            onDismissRequest = { permanentlyDelete = null },
+            icon = { Icon(Icons.Default.DeleteForever, null) },
+            title = { Text("Delete forever?") },
+            text = {
+                Text(
+                    "“${noteDisplayTitle(note)}” and its recording, actions, search vector, reviews, and unsupported graph facts will be permanently removed. This cannot be undone."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.permanentlyDeleteNote(note) { permanentlyDelete = null }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) { Text("Delete forever") }
+            },
+            dismissButton = {
+                TextButton(onClick = { permanentlyDelete = null }) { Text("Cancel") }
+            }
+        )
+    }
 }
 
-private enum class NotesMode { RECENT, TIMELINE }
+private enum class NotesMode { RECENT, TIMELINE, TRASH }
 
 @Composable
 private fun LibraryStat(
@@ -1389,6 +1443,74 @@ private fun EmptyNotesState(isSearching: Boolean, onNewNote: () -> Unit) {
         if (!isSearching) {
             Spacer(Modifier.height(18.dp))
             Button(onClick = onNewNote) { Text("Create your first note") }
+        }
+    }
+}
+
+@Composable
+private fun EmptyTrashState() {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 56.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Surface(shape = CircleShape, color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.size(72.dp)) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(Icons.Default.DeleteSweep, null, Modifier.size(32.dp))
+            }
+        }
+        Spacer(Modifier.height(16.dp))
+        Text("Trash is empty", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Deleted notes stay recoverable here until you remove them forever.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+    }
+}
+
+@Composable
+private fun TrashedNoteCard(
+    item: TrashedNote,
+    onRestore: () -> Unit,
+    onDeleteForever: () -> Unit
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
+        shape = RoundedCornerShape(18.dp)
+    ) {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.DeleteOutline, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(noteDisplayTitle(item.note), fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Text(
+                        "Deleted ${formatRelativeDay(item.deletedTimestamp)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Text(
+                notePreviewText(item.note),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
+                TextButton(onClick = onDeleteForever) {
+                    Icon(Icons.Default.DeleteForever, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Delete forever")
+                }
+                Button(onClick = onRestore) {
+                    Icon(Icons.Default.RestoreFromTrash, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Restore")
+                }
+            }
         }
     }
 }
@@ -1518,9 +1640,11 @@ fun NoteCard(
     isPlaying: Boolean,
     onOpen: () -> Unit,
     onRelated: () -> Unit,
+    onTrash: () -> Unit,
     onTogglePlayback: () -> Unit,
     onRetryTranscription: () -> Unit
 ) {
+    var menuExpanded by remember { mutableStateOf(false) }
     Card(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen),
         shape = RoundedCornerShape(18.dp),
@@ -1555,12 +1679,21 @@ fun NoteCard(
                         tint = MaterialTheme.colorScheme.primary
                     )
                 }
-                Icon(
-                    Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                    contentDescription = "Open note",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 12.dp)
-                )
+                Box {
+                    IconButton(onClick = { menuExpanded = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "Note options")
+                    }
+                    DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Move to Trash") },
+                            leadingIcon = { Icon(Icons.Default.DeleteOutline, null) },
+                            onClick = {
+                                menuExpanded = false
+                                onTrash()
+                            }
+                        )
+                    }
+                }
             }
             Spacer(Modifier.height(12.dp))
             Text(
@@ -1660,6 +1793,7 @@ private fun NoteComposerSheet(
     val speechModelReady by viewModel.speechModelReady.collectAsState()
     val speechDownloadProgress by viewModel.speechDownloadProgress.collectAsState()
     val playingNoteId by viewModel.playingNoteId.collectAsState()
+    var confirmTrash by rememberSaveable(existingNote?.id) { mutableStateOf(false) }
     val context = LocalContext.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val microphonePermission = rememberLauncherForActivityResult(
@@ -1854,7 +1988,42 @@ private fun NoteComposerSheet(
                     Text(if (existingNote == null) "Save note" else "Save changes")
                 }
             }
+            if (existingNote != null) {
+                Spacer(Modifier.height(10.dp))
+                OutlinedButton(
+                    onClick = { confirmTrash = true },
+                    enabled = !isIngesting && !isRecording && !isVoiceCaptureBusy,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Icon(Icons.Default.DeleteOutline, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Move note to Trash")
+                }
+            }
         }
+    }
+
+    if (confirmTrash && existingNote != null) {
+        AlertDialog(
+            onDismissRequest = { confirmTrash = false },
+            title = { Text("Move note to Trash?") },
+            text = { Text("The note can be restored later. Its actions and graph facts will be hidden while it is in Trash.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.moveNoteToTrash(existingNote) {
+                            confirmTrash = false
+                            onDismiss()
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) { Text("Move to Trash") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmTrash = false }) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -2804,6 +2973,7 @@ private fun defaultBackupFilename(): String =
 fun ChatScreen(viewModel: BrainViewModel) {
     var queryText by rememberSaveable { mutableStateOf("") }
     val messages by viewModel.chatMessages.collectAsState()
+    val pendingMutation by viewModel.pendingAgentMutation.collectAsState()
     val isGenerating by viewModel.isGenerating.collectAsState()
     val modelReady by viewModel.modelReady.collectAsState()
     val modelLoaded by viewModel.modelLoaded.collectAsState()
@@ -2852,6 +3022,14 @@ fun ChatScreen(viewModel: BrainViewModel) {
             items(messages) { message -> ChatBubble(message) }
         }
 
+        pendingMutation?.let { pending ->
+            AgentConfirmationCard(
+                pending = pending,
+                onConfirm = viewModel::confirmAgentMutation,
+                onCancel = viewModel::cancelAgentMutation
+            )
+        }
+
         Surface(color = MaterialTheme.colorScheme.surfaceContainer, tonalElevation = 2.dp, shadowElevation = 4.dp) {
             Row(
                 modifier = Modifier.fillMaxWidth().imePadding().padding(12.dp),
@@ -2860,7 +3038,7 @@ fun ChatScreen(viewModel: BrainViewModel) {
                 OutlinedTextField(
                     value = queryText,
                     onValueChange = { queryText = it },
-                    placeholder = { Text("Ask about your notes") },
+                    placeholder = { Text("Ask—or tell the agent what to change") },
                     modifier = Modifier.weight(1f),
                     singleLine = true,
                     shape = RoundedCornerShape(18.dp),
@@ -2915,14 +3093,45 @@ private fun AskEmptyState(onSuggestion: (String) -> Unit) {
         Spacer(Modifier.height(22.dp))
         listOf(
             "What have I learned recently?",
-            "Which ideas are connected?",
-            "Summarize my important decisions"
+            "Create a note: My next idea is…",
+            "Show my deleted notes"
         ).forEach { suggestion ->
             SuggestionChip(
                 onClick = { onSuggestion(suggestion) },
                 label = { Text(suggestion) },
                 modifier = Modifier.padding(vertical = 3.dp)
             )
+        }
+    }
+}
+
+@Composable
+private fun AgentConfirmationCard(
+    pending: PendingAgentMutation,
+    onConfirm: () -> Unit,
+    onCancel: () -> Unit
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.errorContainer,
+        tonalElevation = 2.dp
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.GppMaybe, null, tint = MaterialTheme.colorScheme.onErrorContainer)
+                Spacer(Modifier.width(9.dp))
+                Text("Confirmation required", fontWeight = FontWeight.SemiBold)
+            }
+            Text(pending.prompt, style = MaterialTheme.typography.bodyMedium)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
+                TextButton(onClick = onCancel) { Text("Cancel") }
+                Button(
+                    onClick = onConfirm,
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) { Text("Confirm change") }
+            }
         }
     }
 }
@@ -2994,6 +3203,18 @@ fun ChatBubble(message: ChatMessageItem) {
             modifier = Modifier.widthIn(max = 360.dp)
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
+                if (!isUser && message.toolName != null) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.BuildCircle, null, Modifier.size(17.dp), tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            message.toolName.replace('_', ' ').replaceFirstChar { it.uppercase() },
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
                 Text(
                     text = message.text.ifBlank { "Thinking…" }.replace("**", ""),
                     color = if (isUser) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
