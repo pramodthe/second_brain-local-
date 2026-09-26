@@ -243,7 +243,7 @@ class LlmEngine(private val context: Context) {
         withContext(Dispatchers.IO) {
             operationMutex.withLock {
                 Log.i(TAG, "Generating schema-constrained agent route")
-                generateSingleTurn(systemPrompt, userPrompt, maxTokens = 384).also { result ->
+                generateSingleTurn(systemPrompt, userPrompt, maxTokens = 48).also { result ->
                     result.onSuccess { Log.i(TAG, "Agent route generated (${it.length} chars)") }
                     result.onFailure { Log.e(TAG, "Agent route generation failed: ${it.message}") }
                 }

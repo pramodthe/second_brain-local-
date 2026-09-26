@@ -75,6 +75,10 @@ class BrainProbeReceiver : BroadcastReceiver() {
 
     private suspend fun runAgentRouterDiagnostic(context: Context) {
         Log.i(TAG, "================== START AGENT ROUTER PROBE ==================")
+        val resultFile = context.filesDir.resolve("probe/agent-router-result.txt")
+        resultFile.parentFile?.mkdirs()
+        resultFile.writeText("RUNNING")
+        var rawOutput = ""
         val llm = (context.applicationContext as SecondBrainApplication).llmEngine
         val note = NoteDocument(
             id = "probe-router-note",
@@ -96,7 +100,11 @@ class BrainProbeReceiver : BroadcastReceiver() {
                     actions = emptyList()
                 ),
                 modelAvailable = true,
-                generate = llm::generateAgentRoute
+                generate = { systemPrompt, userPrompt ->
+                    llm.generateAgentRoute(systemPrompt, userPrompt).also { result ->
+                        result.onSuccess { rawOutput = it.take(4_000) }
+                    }
+                }
             )
             check(route is AgentRoute.Tool) { "Qwen did not select a tool: $route" }
             check(route.source == AgentRoute.Source.QWEN) { "The deterministic fallback handled the probe" }
@@ -104,8 +112,12 @@ class BrainProbeReceiver : BroadcastReceiver() {
             check(command is AgentCommand.TrashNote && command.noteId == note.id) {
                 "Qwen selected an unexpected command: $command"
             }
+            resultFile.writeText("PASS: natural request -> validated trash_note(${note.id})")
             Log.i(TAG, "AGENT ROUTER PASS: natural request -> validated trash_note(${note.id})")
         } catch (error: Throwable) {
+            resultFile.writeText(
+                "FAIL: ${error.message ?: error::class.java.simpleName}\nRAW:\n$rawOutput"
+            )
             Log.e(TAG, "AGENT ROUTER FAIL: ${error.message}", error)
         }
         Log.i(TAG, "================== AGENT ROUTER PROBE COMPLETE ==================")

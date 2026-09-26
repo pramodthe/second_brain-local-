@@ -255,7 +255,7 @@ adb shell am broadcast \
   -a com.secondbrain.app.PROBE \
   -n com.secondbrain.app/.probe.BrainProbeReceiver \
   --ez agent_router_only true
-adb logcat -d -s BrainProbe:V
+adb shell run-as com.secondbrain.app cat files/probe/agent-router-result.txt
 ```
 
 To verify the WorkManager reminder path on Android 13 or newer, first grant notification permission through the in-app prompt (save any dated action). On devices that allow the ADB shell to grant runtime permissions, you can use the first command below. Then run the self-cleaning reminder probe:
