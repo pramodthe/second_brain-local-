@@ -56,6 +56,7 @@ Capture is intentionally durable-first. Original text or audio is written to pri
 - **Phase 6 — Ownership (complete):** encrypted export, safe merge restore, privacy controls, and production hardening.
 - **Phase 7 — Daily brain (in progress):** Today workspace, zero-friction capture, automatic titles, explainable daily reviews, grounded on-device briefings, relevance-ranked memories, grouped actions, direct action editing, and private due reminders.
 - **Phase 8 — Agent control (in progress):** safe note CRUD, recoverable Trash, cascade deletion, conversational tools, local audit records, provenance support, and correction-aware ontology extraction.
+- **Phase 9 — Natural agent routing (in progress):** schema-validated Qwen tool selection, inventory-bound targets, ambiguity handling, prompt-injection boundaries, and deterministic offline fallback.
 
 ## Requirements
 
@@ -94,18 +95,21 @@ Notes support create, read/search, edit, move to Trash, restore, and permanent d
 
 Permanent deletion is only available from Trash and always requires confirmation. It removes the raw note, recording, vector, processing jobs, actions, reminders, review proposals, note-to-entity links, and provenance rows. Entities and relationships are removed only when the deleted note was their final supporting source.
 
-The Ask screen first checks explicit commands against a strict local tool parser; everything else continues through grounded retrieval and Qwen. Supported commands include:
+The Ask screen uses the on-device Qwen model to distinguish knowledge questions from requested actions and to select one tool from a strict allowlist. Qwen sees only a bounded read-only inventory and cannot access CozoDB directly. Every returned tool name, argument, date, and target ID is validated; unknown or ambiguous targets produce a clarification instead of a mutation. Explicit command phrases still work as a deterministic fallback when the model is unavailable.
+
+Supported actions include:
 
 - `Create a note: ...` or `Remember that ...`
 - `List my notes` and `Show my deleted notes`
 - `Rename note Project plan to 2027 plan`
 - `Update note Project plan to say ...`
+- `Append to note Project plan: ...`
 - `Delete note Project plan`
 - `Restore note Project plan`
 - `Add task Call Sam tomorrow`
 - `Complete action Call Sam`
 
-Create, restore, list, and action-status tools can run immediately. Trash, rename, and content replacement produce a visible confirmation card before any mutation. Executed tools are recorded in the local audit relation. The language model does not receive unrestricted database access.
+Natural phrasing also works when Qwen is loaded—for example, “Please get rid of yesterday’s meeting note” can resolve to a validated note ID. Create, restore, list, and action-status tools can run immediately. Trash, rename, content replacement, and append produce a visible confirmation card before any existing note is changed. Permanent deletion remains restricted to the Trash UI. Executed tools are recorded in the local audit relation.
 
 ## Automatic ontology maintenance
 
@@ -241,6 +245,16 @@ adb shell am broadcast \
   -a com.secondbrain.app.PROBE \
   -n com.secondbrain.app/.probe.BrainProbeReceiver \
   --ez crud_only true
+adb logcat -d -s BrainProbe:V
+```
+
+To load Qwen on the GPU and verify that a natural request becomes a validated tool call without changing stored data:
+
+```bash
+adb shell am broadcast \
+  -a com.secondbrain.app.PROBE \
+  -n com.secondbrain.app/.probe.BrainProbeReceiver \
+  --ez agent_router_only true
 adb logcat -d -s BrainProbe:V
 ```
 

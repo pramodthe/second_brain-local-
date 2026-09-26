@@ -4,14 +4,15 @@ import java.time.LocalDate
 
 sealed interface AgentCommand {
     data class CreateNote(val title: String, val content: String) : AgentCommand
-    data class RenameNote(val query: String, val newTitle: String) : AgentCommand
-    data class ReplaceNote(val query: String, val newContent: String) : AgentCommand
-    data class TrashNote(val query: String) : AgentCommand
-    data class RestoreNote(val query: String) : AgentCommand
+    data class RenameNote(val query: String, val newTitle: String, val noteId: String? = null) : AgentCommand
+    data class ReplaceNote(val query: String, val newContent: String, val noteId: String? = null) : AgentCommand
+    data class AppendNote(val query: String, val addition: String, val noteId: String? = null) : AgentCommand
+    data class TrashNote(val query: String, val noteId: String? = null) : AgentCommand
+    data class RestoreNote(val query: String, val noteId: String? = null) : AgentCommand
     data object ListNotes : AgentCommand
     data object ListTrash : AgentCommand
     data class CreateAction(val text: String, val dueDate: LocalDate?) : AgentCommand
-    data class CompleteAction(val query: String) : AgentCommand
+    data class CompleteAction(val query: String, val actionId: String? = null) : AgentCommand
 }
 
 /** Strict local parser for mutating chat commands. Unknown text remains a normal RAG question. */
@@ -37,6 +38,11 @@ object AgentCommandParser {
             val query = match.groupValues[1].cleanQuery()
             val content = match.groupValues[2].cleanValue()
             if (query.isNotBlank() && content.isNotBlank()) return AgentCommand.ReplaceNote(query, content)
+        }
+        APPEND_NOTE.matchEntire(text)?.let { match ->
+            val query = match.groupValues[1].cleanQuery()
+            val addition = match.groupValues[2].cleanValue()
+            if (query.isNotBlank() && addition.isNotBlank()) return AgentCommand.AppendNote(query, addition)
         }
         CREATE_NOTE.matchEntire(text)?.let { match ->
             val title = match.groupValues[1].cleanValue()
@@ -89,6 +95,10 @@ object AgentCommandParser {
     )
     private val REPLACE_NOTE = Regex(
         "(?:replace|update)(?: the)? note(?: named| called)?[ :]+(.+?)\\s+(?:with|to say)\\s+(.+)",
+        RegexOption.IGNORE_CASE
+    )
+    private val APPEND_NOTE = Regex(
+        "(?:append|add)(?: this)? to(?: the)? note(?: named| called)?[ :]+(.+?)(?:\\s+with|:)\\s+(.+)",
         RegexOption.IGNORE_CASE
     )
     private val CREATE_NOTE = Regex(

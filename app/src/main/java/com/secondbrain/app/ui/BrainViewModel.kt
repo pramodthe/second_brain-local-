@@ -27,7 +27,9 @@ import com.secondbrain.app.data.SubgraphContext
 import com.secondbrain.app.data.TranscriptionStatus
 import com.secondbrain.app.data.TrashedNote
 import com.secondbrain.app.domain.AgentCommand
-import com.secondbrain.app.domain.AgentCommandParser
+import com.secondbrain.app.domain.AgentRoute
+import com.secondbrain.app.domain.AgentToolInventory
+import com.secondbrain.app.domain.AgentToolRouter
 import com.secondbrain.app.domain.HybridRetriever
 import com.secondbrain.app.domain.IngestionPipeline
 import com.secondbrain.app.domain.DailyReview
@@ -53,7 +55,7 @@ data class ChatMessageItem(
     val toolName: String? = null
 )
 
-enum class AgentMutationKind { TRASH_NOTE, RENAME_NOTE, REPLACE_NOTE }
+enum class AgentMutationKind { TRASH_NOTE, RENAME_NOTE, REPLACE_NOTE, APPEND_NOTE }
 
 data class PendingAgentMutation(
     val kind: AgentMutationKind,
@@ -91,6 +93,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
 
     val pipeline = IngestionPipeline(store, embedder, llm)
     val retriever = HybridRetriever(store, embedder)
+    private val agentToolRouter = AgentToolRouter()
     private val backupManager = BackupManager(application, store, embedder)
 
     private val _notes = MutableStateFlow<List<NoteDocument>>(emptyList())
@@ -786,9 +789,29 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
 
-                AgentCommandParser.parse(query)?.let { command ->
-                    handleAgentCommand(command)
-                    return@launch
+                when (
+                    val route = agentToolRouter.route(
+                        input = query,
+                        inventory = AgentToolInventory(
+                            activeNotes = _notes.value,
+                            trashedNotes = _trashedNotes.value.map(TrashedNote::note),
+                            actions = _actionItems.value
+                        ),
+                        modelAvailable = llm.isEngineLoaded(),
+                        generate = llm::generateAgentRoute
+                    )
+                ) {
+                    is AgentRoute.Tool -> {
+                        handleAgentCommand(route.command)
+                        return@launch
+                    }
+
+                    is AgentRoute.Clarify -> {
+                        appendToolMessage("clarification_required", route.message)
+                        return@launch
+                    }
+
+                    AgentRoute.Question -> Unit
                 }
 
                 // 1. Retrieve hybrid subgraph context
@@ -866,6 +889,20 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
                         )
                         appendToolMessage("update_note", "Updated “${agentNoteTitle(pending.note)}”. The knowledge graph will be rebuilt from the new content.")
                     }
+
+                    AgentMutationKind.APPEND_NOTE -> {
+                        val combinedContent = listOf(pending.note.content.trimEnd(), pending.newContent.trim())
+                            .filter(String::isNotBlank)
+                            .joinToString("\n\n")
+                        pipeline.update(pending.note, pending.note.title, combinedContent).getOrThrow()
+                        enqueueJob(pending.note.id, ProcessingJobType.ORGANIZE)
+                        store.recordAgentAudit(
+                            "append_note",
+                            pending.note.id,
+                            "Appended content to '${agentNoteTitle(pending.note)}'"
+                        )
+                        appendToolMessage("append_note", "Added the new text to “${agentNoteTitle(pending.note)}” and queued graph organization.")
+                    }
                 }
                 _pendingAgentMutation.value = null
                 loadData()
@@ -897,7 +934,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             is AgentCommand.TrashNote -> {
-                val note = resolveSingleNote(command.query, _notes.value) ?: return
+                val note = resolveSingleNote(command.query, _notes.value, command.noteId) ?: return
                 _pendingAgentMutation.value = PendingAgentMutation(
                     kind = AgentMutationKind.TRASH_NOTE,
                     note = note,
@@ -907,7 +944,11 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             is AgentCommand.RestoreNote -> {
-                val note = resolveSingleNote(command.query, _trashedNotes.value.map(TrashedNote::note)) ?: return
+                val note = resolveSingleNote(
+                    command.query,
+                    _trashedNotes.value.map(TrashedNote::note),
+                    command.noteId
+                ) ?: return
                 store.restoreNote(note.id).getOrThrow()
                 enqueueJob(note.id, ProcessingJobType.ORGANIZE)
                 store.recordAgentAudit("restore_note", note.id, "Restored '${agentNoteTitle(note)}'")
@@ -916,7 +957,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             is AgentCommand.RenameNote -> {
-                val note = resolveSingleNote(command.query, _notes.value) ?: return
+                val note = resolveSingleNote(command.query, _notes.value, command.noteId) ?: return
                 _pendingAgentMutation.value = PendingAgentMutation(
                     kind = AgentMutationKind.RENAME_NOTE,
                     note = note,
@@ -927,7 +968,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             is AgentCommand.ReplaceNote -> {
-                val note = resolveSingleNote(command.query, _notes.value) ?: return
+                val note = resolveSingleNote(command.query, _notes.value, command.noteId) ?: return
                 _pendingAgentMutation.value = PendingAgentMutation(
                     kind = AgentMutationKind.REPLACE_NOTE,
                     note = note,
@@ -935,6 +976,17 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
                     prompt = "Replace the content of “${agentNoteTitle(note)}”? This will rebuild its actions and graph facts."
                 )
                 appendToolMessage("update_note", "I prepared the content replacement. Confirm below before I overwrite the current text.")
+            }
+
+            is AgentCommand.AppendNote -> {
+                val note = resolveSingleNote(command.query, _notes.value, command.noteId) ?: return
+                _pendingAgentMutation.value = PendingAgentMutation(
+                    kind = AgentMutationKind.APPEND_NOTE,
+                    note = note,
+                    newContent = command.addition,
+                    prompt = "Add this text to “${agentNoteTitle(note)}”? The existing content will be kept."
+                )
+                appendToolMessage("append_note", "I prepared text to append to “${agentNoteTitle(note)}”. Confirm below before I change the note.")
             }
 
             AgentCommand.ListNotes -> {
@@ -970,7 +1022,7 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             is AgentCommand.CompleteAction -> {
-                val matches = matchActions(command.query)
+                val matches = matchActions(command.query, command.actionId)
                 if (matches.size != 1) {
                     appendToolMessage(
                         "complete_action",
@@ -988,7 +1040,16 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun resolveSingleNote(query: String, candidates: List<NoteDocument>): NoteDocument? {
+    private fun resolveSingleNote(
+        query: String,
+        candidates: List<NoteDocument>,
+        noteId: String? = null
+    ): NoteDocument? {
+        if (noteId != null) {
+            candidates.singleOrNull { it.id == noteId }?.let { return it }
+            appendToolMessage("find_note", "That note is no longer available in the expected location. Please try again.")
+            return null
+        }
         val matches = matchNotes(query, candidates)
         if (matches.size == 1) return matches.single()
         appendToolMessage(
@@ -1012,9 +1073,10 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun matchActions(query: String): List<ActionItem> {
+    private fun matchActions(query: String, actionId: String? = null): List<ActionItem> {
         val target = normalizeAgentText(query)
         val open = _actionItems.value.filter { it.status == ActionStatus.OPEN }
+        if (actionId != null) return open.filter { it.id == actionId }
         val exact = open.filter { normalizeAgentText(it.text) == target }
         return exact.ifEmpty { open.filter { normalizeAgentText(it.text).contains(target) } }
     }

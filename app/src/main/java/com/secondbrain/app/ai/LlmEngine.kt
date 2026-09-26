@@ -220,7 +220,11 @@ class LlmEngine(private val context: Context) {
             $text
         """.trimIndent()
 
-            val raw = generateSingleTurn(prompt).getOrDefault("")
+            val raw = generateSingleTurn(
+                systemPrompt = "You are a precise structured information extraction system.",
+                prompt = prompt,
+                maxTokens = 768
+            ).getOrDefault("")
             val parsed = parseExtractionJson(raw)
             val fallback = ruleBasedExtraction(text, referenceDate)
             val withGraphFallback = if (parsed.entities.isEmpty() && parsed.relations.isEmpty()) {
@@ -235,26 +239,44 @@ class LlmEngine(private val context: Context) {
         }
     }
 
-    private suspend fun generateSingleTurn(prompt: String): Result<String> = withContext(Dispatchers.IO) {
+    suspend fun generateAgentRoute(systemPrompt: String, userPrompt: String): Result<String> =
+        withContext(Dispatchers.IO) {
+            operationMutex.withLock {
+                Log.i(TAG, "Generating schema-constrained agent route")
+                generateSingleTurn(systemPrompt, userPrompt, maxTokens = 384).also { result ->
+                    result.onSuccess { Log.i(TAG, "Agent route generated (${it.length} chars)") }
+                    result.onFailure { Log.e(TAG, "Agent route generation failed: ${it.message}") }
+                }
+            }
+        }
+
+    private suspend fun generateSingleTurn(
+        systemPrompt: String,
+        prompt: String,
+        maxTokens: Int
+    ): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
             val engine = llm ?: error("LLM not loaded")
             val msgs = arrayOf(
-                ChatMessage("system", "You are a precise structured information extraction system."),
+                ChatMessage("system", systemPrompt),
                 ChatMessage("user", prompt)
             )
             val template = engine.applyChatTemplate(msgs, null, false).getOrThrow()
             val sb = StringBuilder()
-            engine.generateStreamFlow(
-                template.formattedText,
-                GenerationConfig(maxTokens = 768)
-            ).collect { res ->
-                when (res) {
-                    is LlmStreamResult.Token -> sb.append(res.text)
-                    is LlmStreamResult.Error -> throw res.throwable
-                    is LlmStreamResult.Completed -> Unit
+            try {
+                engine.generateStreamFlow(
+                    template.formattedText,
+                    GenerationConfig(maxTokens = maxTokens)
+                ).collect { res ->
+                    when (res) {
+                        is LlmStreamResult.Token -> sb.append(res.text)
+                        is LlmStreamResult.Error -> throw res.throwable
+                        is LlmStreamResult.Completed -> Unit
+                    }
                 }
+            } finally {
+                engine.reset()
             }
-            engine.reset()
             sb.toString()
         }
     }

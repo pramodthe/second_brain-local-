@@ -9,6 +9,7 @@ import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import com.secondbrain.app.SecondBrainApplication
 import com.secondbrain.app.ai.EmbedderEngine
 import com.secondbrain.app.ai.LlmEngine
 import com.secondbrain.app.ai.SpeechEngine
@@ -24,6 +25,10 @@ import com.secondbrain.app.data.RelationEdge
 import com.secondbrain.app.data.RelationType
 import com.secondbrain.app.domain.HybridRetriever
 import com.secondbrain.app.domain.IngestionPipeline
+import com.secondbrain.app.domain.AgentCommand
+import com.secondbrain.app.domain.AgentRoute
+import com.secondbrain.app.domain.AgentToolInventory
+import com.secondbrain.app.domain.AgentToolRouter
 import com.secondbrain.app.work.ProcessingWorkScheduler
 import com.secondbrain.app.work.ActionReminderScheduler
 import kotlinx.coroutines.CoroutineScope
@@ -55,6 +60,8 @@ class BrainProbeReceiver : BroadcastReceiver() {
                     runReminderDiagnostic(context.applicationContext)
                 } else if (intent?.getBooleanExtra(EXTRA_CRUD_ONLY, false) == true) {
                     runCrudDiagnostic(context.applicationContext)
+                } else if (intent?.getBooleanExtra(EXTRA_AGENT_ROUTER_ONLY, false) == true) {
+                    runAgentRouterDiagnostic(context.applicationContext)
                 } else {
                     runDiagnostic(context.applicationContext)
                 }
@@ -64,6 +71,44 @@ class BrainProbeReceiver : BroadcastReceiver() {
                 pending.finish()
             }
         }
+    }
+
+    private suspend fun runAgentRouterDiagnostic(context: Context) {
+        Log.i(TAG, "================== START AGENT ROUTER PROBE ==================")
+        val llm = (context.applicationContext as SecondBrainApplication).llmEngine
+        val note = NoteDocument(
+            id = "probe-router-note",
+            title = "Team meeting",
+            content = "Decisions from the product design meeting.",
+            timestamp = LocalDate.now().minusDays(1)
+                .atStartOfDay(ZoneId.systemDefault()).toEpochSecond().toDouble(),
+            source = "probe"
+        )
+        try {
+            check(llm.isModelReady()) { "Qwen model is not installed" }
+            llm.loadModel(useGpu = true).getOrThrow()
+            Log.i(TAG, "AGENT ROUTER MODEL READY: ${llm.defaultModel.name} on GPU")
+            val route = AgentToolRouter().route(
+                input = "Please get rid of yesterday's meeting note for me",
+                inventory = AgentToolInventory(
+                    activeNotes = listOf(note),
+                    trashedNotes = emptyList(),
+                    actions = emptyList()
+                ),
+                modelAvailable = true,
+                generate = llm::generateAgentRoute
+            )
+            check(route is AgentRoute.Tool) { "Qwen did not select a tool: $route" }
+            check(route.source == AgentRoute.Source.QWEN) { "The deterministic fallback handled the probe" }
+            val command = route.command
+            check(command is AgentCommand.TrashNote && command.noteId == note.id) {
+                "Qwen selected an unexpected command: $command"
+            }
+            Log.i(TAG, "AGENT ROUTER PASS: natural request -> validated trash_note(${note.id})")
+        } catch (error: Throwable) {
+            Log.e(TAG, "AGENT ROUTER FAIL: ${error.message}", error)
+        }
+        Log.i(TAG, "================== AGENT ROUTER PROBE COMPLETE ==================")
     }
 
     private suspend fun runCrudDiagnostic(context: Context) {
@@ -425,6 +470,7 @@ class BrainProbeReceiver : BroadcastReceiver() {
         private const val EXTRA_ACTIONS_ONLY = "actions_only"
         private const val EXTRA_REMINDERS_ONLY = "reminders_only"
         private const val EXTRA_CRUD_ONLY = "crud_only"
+        private const val EXTRA_AGENT_ROUTER_ONLY = "agent_router_only"
         private const val ACTION_PROBE_NOTE_ID = "probe-action-storage"
         private const val REMINDER_PROBE_NOTE_ID = "probe-action-reminder"
         private const val CRUD_PROBE_NOTE_ID = "probe-agent-crud"

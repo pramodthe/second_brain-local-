@@ -31,6 +31,10 @@ class AgentCommandParserTest {
             AgentCommand.ReplaceNote("Project plan", "The new plan"),
             AgentCommandParser.parse("Update note Project plan to say The new plan", today)
         )
+        assertEquals(
+            AgentCommand.AppendNote("Project plan", "Call the design team"),
+            AgentCommandParser.parse("Append to note Project plan: Call the design team", today)
+        )
     }
 
     @Test
