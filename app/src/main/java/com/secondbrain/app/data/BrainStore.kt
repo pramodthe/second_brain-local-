@@ -899,6 +899,16 @@ class BrainStore(private val context: Context) {
             }
         }
 
+    /** Removes an action and its local override/reminder records. Used to roll back agent-created actions. */
+    suspend fun deleteAction(id: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val d = db ?: error("Database not open")
+            check(queryActionItems(d, id = id, limit = 1).isNotEmpty()) { "Action not found" }
+            removeAction(d, id)
+            Unit
+        }
+    }
+
     suspend fun restoreActionItems(items: List<ActionItem>): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val d = db ?: error("Database not open")

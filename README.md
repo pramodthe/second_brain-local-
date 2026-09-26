@@ -55,15 +55,15 @@ Capture is intentionally durable-first. Original text or audio is written to pri
 - **Phase 5 — Retrieval (complete):** hybrid-ranked search, related notes, timelines, and source-grounded answers.
 - **Phase 6 — Ownership (complete):** encrypted export, safe merge restore, privacy controls, and production hardening.
 - **Phase 7 — Daily brain (in progress):** Today workspace, zero-friction capture, automatic titles, explainable daily reviews, grounded on-device briefings, relevance-ranked memories, grouped actions, direct action editing, and private due reminders.
-- **Phase 8 — Agent control (in progress):** safe note CRUD, recoverable Trash, cascade deletion, conversational tools, local audit records, provenance support, and correction-aware ontology extraction.
-- **Phase 9 — Natural agent routing (in progress):** schema-validated Qwen tool selection, inventory-bound targets, ambiguity handling, prompt-injection boundaries, and deterministic offline fallback.
+- **Phase 8 — Agent control:** safe note CRUD, recoverable Trash, cascade deletion, conversational tools, local audit records, provenance support, and correction-aware ontology extraction.
+- **Phase 9 — Natural agent routing:** schema-validated Qwen tool selection, inventory-bound targets, ambiguity handling, prompt-injection boundaries, deterministic offline fallback, multi-step plans, rollback, and Undo.
 
 ## Requirements
 
 - Android Studio with Android SDK Platform 35.
 - JDK 17.
 - An Android 9 (API 28) or newer `arm64-v8a` device or emulator.
-- A high-memory Android device for the default 9B model; the tested device has 16 GB RAM.
+- A modern arm64 Android device; the default 4B model is tuned for practical phone latency and memory use.
 - A connected device and Android Platform Tools for installation and probe commands.
 - Microphone permission when recording a voice note.
 
@@ -77,7 +77,7 @@ The microphone button starts a voice note from the same card. Stopping preserves
 
 ## Intelligent daily review
 
-Today builds an instant daily plan locally, without waiting for the 9B model. It prioritizes overdue, due-today, upcoming, and undated actions; tracks today's completed work; and resurfaces older notes using shared accepted entities, active-action provenance, recurring topics, age, and recency. Each resurfaced memory explains why it was selected and opens its original note.
+Today builds an instant daily plan locally, without waiting for the language model. It prioritizes overdue, due-today, upcoming, and undated actions; tracks today's completed work; and resurfaces older notes using shared accepted entities, active-action provenance, recurring topics, age, and recency. Each resurfaced memory explains why it was selected and opens its original note.
 
 When the Qwen model is loaded, **Create AI briefing** produces an optional concise summary from only the selected actions, accepted graph facts, and numbered source notes. The response streams on-device and exposes buttons back to its original notes. The deterministic review remains usable while the model is absent, loading, or busy.
 
@@ -109,7 +109,7 @@ Supported actions include:
 - `Add task Call Sam tomorrow`
 - `Complete action Call Sam`
 
-Natural phrasing also works when Qwen is loaded—for example, “Please get rid of yesterday’s meeting note” can resolve to a validated note ID. Create, restore, list, and action-status tools can run immediately. Trash, rename, content replacement, and append produce a visible confirmation card before any existing note is changed. Permanent deletion remains restricted to the Trash UI. Executed tools are recorded in the local audit relation.
+Natural phrasing also works when Qwen is loaded—for example, “Please get rid of yesterday’s meeting note” can resolve to a validated note ID. Requests containing two to six operations become one ordered plan. All writes are previewed together and require one confirmation; read-only lists can run immediately. A failed plan rolls back its completed steps, and the most recent successful plan can be undone from the Ask screen. Permanent deletion remains restricted to the Trash UI. Every executed step and plan outcome is recorded in the local audit relation.
 
 ## Automatic ontology maintenance
 
@@ -138,9 +138,9 @@ sdk.dir=/absolute/path/to/Android/sdk
 
 ### Language and knowledge extraction
 
-The default model is [Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF), using the `Q4_K_M` quantization (5,680,522,464 bytes). The app downloads it into private app storage and runs it through Nexa SDK 0.0.24 with the OpenCL GPU backend. Model files are intentionally excluded from source control.
+The default model is [Qwen3.5-4B-GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF), using the `Q4_K_M` quantization (2,740,937,888 bytes). It is the phone-first balance: substantially lower memory pressure and faster prompt processing than 9B, while retaining strong instruction-following and agent capability. The app downloads it into private app storage and runs it through Nexa SDK 0.0.24 with the OpenCL GPU backend. After the 4B model is installed, superseded private 0.6B and 9B model files are removed to recover storage. Model files are intentionally excluded from source control.
 
-This is a demanding mobile configuration. On the tested RMX5011/Snapdragon 8 Elite device with 16 GB RAM, the model loaded in roughly 23 seconds and Nexa reported about 10.2 prompt tokens/second and 2.7 generated tokens/second. Performance and memory use vary by device and runtime. Without the model, capture, graph storage, search, and rule-based extraction continue to work; chat presents retrieved graph context instead of generating an LLM response.
+Performance and memory use vary by device and runtime. The 4B default replaces the earlier 9B configuration specifically to reduce prompt latency, startup time, thermal load, and peak memory use on the tested RMX5011/Snapdragon 8 Elite. Without the model, capture, graph storage, search, and rule-based extraction continue to work; chat presents retrieved graph context instead of generating an LLM response.
 
 ### Speech recognition
 

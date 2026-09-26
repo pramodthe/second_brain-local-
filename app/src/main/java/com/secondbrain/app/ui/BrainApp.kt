@@ -2973,7 +2973,9 @@ private fun defaultBackupFilename(): String =
 fun ChatScreen(viewModel: BrainViewModel) {
     var queryText by rememberSaveable { mutableStateOf("") }
     val messages by viewModel.chatMessages.collectAsState()
-    val pendingMutation by viewModel.pendingAgentMutation.collectAsState()
+    val pendingPlan by viewModel.pendingAgentPlan.collectAsState()
+    val executions by viewModel.agentExecutions.collectAsState()
+    val canUndoPlan by viewModel.canUndoAgentPlan.collectAsState()
     val isGenerating by viewModel.isGenerating.collectAsState()
     val modelReady by viewModel.modelReady.collectAsState()
     val modelLoaded by viewModel.modelLoaded.collectAsState()
@@ -3005,7 +3007,7 @@ fun ChatScreen(viewModel: BrainViewModel) {
                 Box(Modifier.size(8.dp).clip(CircleShape).background(Color(0xFF42B883)))
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    "Qwen3.5 9B · On-device GPU",
+                    "Qwen3.5 4B · On-device GPU",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -3022,11 +3024,19 @@ fun ChatScreen(viewModel: BrainViewModel) {
             items(messages) { message -> ChatBubble(message) }
         }
 
-        pendingMutation?.let { pending ->
-            AgentConfirmationCard(
+        pendingPlan?.let { pending ->
+            AgentPlanConfirmationCard(
                 pending = pending,
-                onConfirm = viewModel::confirmAgentMutation,
-                onCancel = viewModel::cancelAgentMutation
+                onConfirm = viewModel::confirmAgentPlan,
+                onCancel = viewModel::cancelAgentPlan
+            )
+        }
+
+        if (pendingPlan == null) executions.firstOrNull()?.let { execution ->
+            AgentExecutionCard(
+                execution = execution,
+                canUndo = canUndoPlan && execution.status == AgentExecutionStatus.SUCCEEDED,
+                onUndo = viewModel::undoLastAgentPlan
             )
         }
 
@@ -3106,8 +3116,8 @@ private fun AskEmptyState(onSuggestion: (String) -> Unit) {
 }
 
 @Composable
-private fun AgentConfirmationCard(
-    pending: PendingAgentMutation,
+private fun AgentPlanConfirmationCard(
+    pending: PendingAgentPlan,
     onConfirm: () -> Unit,
     onCancel: () -> Unit
 ) {
@@ -3124,13 +3134,80 @@ private fun AgentConfirmationCard(
                 Spacer(Modifier.width(9.dp))
                 Text("Confirmation required", fontWeight = FontWeight.SemiBold)
             }
-            Text(pending.prompt, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                "The agent will run these ${pending.steps.size} ${if (pending.steps.size == 1) "step" else "steps"} in order:",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            pending.steps.forEachIndexed { index, step ->
+                Row(verticalAlignment = Alignment.Top) {
+                    Surface(
+                        modifier = Modifier.size(24.dp),
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.error.copy(alpha = 0.14f)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text("${index + 1}", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text(step.title, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
+                        Text(step.detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
                 TextButton(onClick = onCancel) { Text("Cancel") }
                 Button(
                     onClick = onConfirm,
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                 ) { Text("Confirm change") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AgentExecutionCard(
+    execution: AgentExecutionUi,
+    canUndo: Boolean,
+    onUndo: () -> Unit
+) {
+    val color = when (execution.status) {
+        AgentExecutionStatus.SUCCEEDED -> MaterialTheme.colorScheme.tertiaryContainer
+        AgentExecutionStatus.FAILED -> MaterialTheme.colorScheme.errorContainer
+        AgentExecutionStatus.UNDONE -> MaterialTheme.colorScheme.surfaceVariant
+        AgentExecutionStatus.RUNNING -> MaterialTheme.colorScheme.secondaryContainer
+    }
+    Surface(color = color, tonalElevation = 1.dp) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                when (execution.status) {
+                    AgentExecutionStatus.SUCCEEDED -> Icons.Default.CheckCircle
+                    AgentExecutionStatus.FAILED -> Icons.Default.ErrorOutline
+                    AgentExecutionStatus.UNDONE -> Icons.Default.History
+                    AgentExecutionStatus.RUNNING -> Icons.Default.Sync
+                },
+                contentDescription = null,
+                modifier = Modifier.size(20.dp)
+            )
+            Spacer(Modifier.width(9.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Agent history · ${execution.message}", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    execution.stepSummaries.joinToString(" · ").take(180),
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (canUndo) TextButton(onClick = onUndo) {
+                Icon(Icons.Default.History, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(5.dp))
+                Text("Undo")
             }
         }
     }
@@ -3156,8 +3233,8 @@ private fun ModelSetupCard(
                 Column(modifier = Modifier.weight(1f)) {
                     Text("Private on-device AI", fontWeight = FontWeight.SemiBold)
                     Text(
-                        if (modelReady) "Qwen3.5 9B is ready to load."
-                        else "Download the 5.7 GB model to answer privately.",
+                        if (modelReady) "Qwen3.5 4B is ready to load."
+                        else "Download the 2.7 GB model to answer privately.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }

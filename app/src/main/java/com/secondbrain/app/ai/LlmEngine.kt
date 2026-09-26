@@ -52,10 +52,10 @@ class LlmEngine(private val context: Context) {
     private var sdkInitialized = false
 
     val defaultModel = ModelInfo(
-        name = "Qwen3.5-9B",
-        filename = "Qwen3.5-9B-Q4_K_M.gguf",
-        repo = "unsloth/Qwen3.5-9B-GGUF",
-        expectedBytes = 5_680_522_464L
+        name = "Qwen3.5-4B",
+        filename = "Qwen3.5-4B-Q4_K_M.gguf",
+        repo = "unsloth/Qwen3.5-4B-GGUF",
+        expectedBytes = 2_740_937_888L
     )
 
     val modelDir: File
@@ -119,6 +119,7 @@ class LlmEngine(private val context: Context) {
                     .getOrThrow()
 
                 llm = instance
+                removeLegacyModelFiles()
                 Log.i(TAG, "${defaultModel.name} loaded on ${dev.name}")
                 Unit
             }
@@ -176,7 +177,17 @@ class LlmEngine(private val context: Context) {
                 "Model download has an unexpected size (${part.length()} of ${defaultModel.expectedBytes} bytes)"
             }
             check(part.renameTo(target)) { "Failed to rename part to target file" }
+            removeLegacyModelFiles()
             Unit
+        }
+    }
+
+    private fun removeLegacyModelFiles() {
+        LEGACY_MODEL_FILENAMES.forEach { filename ->
+            modelDir.resolve(filename).takeIf(File::isFile)?.let { legacy ->
+                if (legacy.delete()) Log.i(TAG, "Removed superseded model ${legacy.name}")
+            }
+            modelDir.resolve("$filename.part").takeIf(File::isFile)?.delete()
         }
     }
 
@@ -243,7 +254,7 @@ class LlmEngine(private val context: Context) {
         withContext(Dispatchers.IO) {
             operationMutex.withLock {
                 Log.i(TAG, "Generating schema-constrained agent route")
-                generateSingleTurn(systemPrompt, userPrompt, maxTokens = 48).also { result ->
+                generateSingleTurn(systemPrompt, userPrompt, maxTokens = 32).also { result ->
                     result.onSuccess { Log.i(TAG, "Agent route generated (${it.length} chars)") }
                     result.onFailure { Log.e(TAG, "Agent route generation failed: ${it.message}") }
                 }
@@ -511,6 +522,10 @@ class LlmEngine(private val context: Context) {
     }
 
     companion object {
+        private val LEGACY_MODEL_FILENAMES = setOf(
+            "Qwen3-0.6B-Q4_0.gguf",
+            "Qwen3.5-9B-Q4_K_M.gguf"
+        )
         private const val TAG = "SecondBrainLlm"
         private val STOP_WORDS = setOf(
             "the", "this", "that", "there", "what", "where", "how", "why", "and", "but",

@@ -7,6 +7,17 @@ import org.junit.Test
 import java.time.LocalDate
 
 class AgentCommandParserTest {
+    @Test
+    fun `parses an explicit sequence into an ordered plan`() {
+        assertEquals(
+            listOf(
+                AgentCommand.CreateAction("Call Sam", null),
+                AgentCommand.ListNotes
+            ),
+            AgentCommandParser.parsePlan("Create a task Call Sam and then list my notes")
+        )
+    }
+
     private val today = LocalDate.of(2026, 9, 25)
 
     @Test

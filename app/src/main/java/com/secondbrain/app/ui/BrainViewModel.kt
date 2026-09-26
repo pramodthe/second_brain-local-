@@ -46,6 +46,7 @@ import kotlinx.coroutines.launch
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.util.UUID
 
 data class ChatMessageItem(
     val sender: String, // "user" or "brain"
@@ -55,14 +56,48 @@ data class ChatMessageItem(
     val toolName: String? = null
 )
 
-enum class AgentMutationKind { TRASH_NOTE, RENAME_NOTE, REPLACE_NOTE, APPEND_NOTE }
+data class AgentPlanStep(
+    val command: AgentCommand,
+    val title: String,
+    val detail: String,
+    val changesData: Boolean
+)
 
-data class PendingAgentMutation(
-    val kind: AgentMutationKind,
-    val note: NoteDocument,
-    val newTitle: String = "",
-    val newContent: String = "",
-    val prompt: String
+data class PendingAgentPlan(
+    val id: String = "plan-${UUID.randomUUID()}",
+    val steps: List<AgentPlanStep>,
+    val source: AgentRoute.Source
+)
+
+enum class AgentExecutionStatus { RUNNING, SUCCEEDED, FAILED, UNDONE }
+
+data class AgentExecutionUi(
+    val id: String,
+    val stepSummaries: List<String>,
+    val status: AgentExecutionStatus,
+    val message: String,
+    val completedAt: Long = System.currentTimeMillis()
+)
+
+private sealed interface AgentUndoOperation {
+    data class TrashCreatedNote(val noteId: String) : AgentUndoOperation
+    data class RestoreTrashedNote(val noteId: String) : AgentUndoOperation
+    data class TrashRestoredNote(val noteId: String) : AgentUndoOperation
+    data class RestoreNoteSnapshot(val note: NoteDocument) : AgentUndoOperation
+    data class DeleteCreatedAction(val actionId: String) : AgentUndoOperation
+    data class RestoreActionStatus(val actionId: String, val status: ActionStatus) : AgentUndoOperation
+}
+
+private data class UndoableAgentPlan(
+    val executionId: String,
+    val operations: List<AgentUndoOperation>
+)
+
+private data class AppliedAgentStep(
+    val tool: String,
+    val targetId: String,
+    val summary: String,
+    val undo: AgentUndoOperation?
 )
 
 data class BackupUiState(
@@ -114,8 +149,15 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
     private val _chatMessages = MutableStateFlow<List<ChatMessageItem>>(emptyList())
     val chatMessages: StateFlow<List<ChatMessageItem>> = _chatMessages.asStateFlow()
 
-    private val _pendingAgentMutation = MutableStateFlow<PendingAgentMutation?>(null)
-    val pendingAgentMutation: StateFlow<PendingAgentMutation?> = _pendingAgentMutation.asStateFlow()
+    private val _pendingAgentPlan = MutableStateFlow<PendingAgentPlan?>(null)
+    val pendingAgentPlan: StateFlow<PendingAgentPlan?> = _pendingAgentPlan.asStateFlow()
+
+    private val _agentExecutions = MutableStateFlow<List<AgentExecutionUi>>(emptyList())
+    val agentExecutions: StateFlow<List<AgentExecutionUi>> = _agentExecutions.asStateFlow()
+
+    private val _canUndoAgentPlan = MutableStateFlow(false)
+    val canUndoAgentPlan: StateFlow<Boolean> = _canUndoAgentPlan.asStateFlow()
+    private var undoableAgentPlan: UndoableAgentPlan? = null
 
     private val _noteSearchResults = MutableStateFlow<List<RetrievedSource>>(emptyList())
     val noteSearchResults: StateFlow<List<RetrievedSource>> = _noteSearchResults.asStateFlow()
@@ -781,10 +823,10 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
                 val userMsg = ChatMessageItem("user", query)
                 _chatMessages.value = _chatMessages.value + userMsg
 
-                if (_pendingAgentMutation.value != null) {
+                if (_pendingAgentPlan.value != null) {
                     appendToolMessage(
                         "confirmation_required",
-                        "Confirm or cancel the pending change before asking me to modify something else."
+                        "Confirm or cancel the pending plan before asking me to modify something else."
                     )
                     return@launch
                 }
@@ -802,7 +844,12 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 ) {
                     is AgentRoute.Tool -> {
-                        handleAgentCommand(route.command)
+                        stageAgentPlan(listOf(route.command), route.source)
+                        return@launch
+                    }
+
+                    is AgentRoute.Plan -> {
+                        stageAgentPlan(route.commands, route.source)
                         return@launch
                     }
 
@@ -851,61 +898,14 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun confirmAgentMutation() {
-        val pending = _pendingAgentMutation.value ?: return
+    fun confirmAgentPlan() {
+        val pending = _pendingAgentPlan.value ?: return
         if (_isGenerating.value) return
         viewModelScope.launch {
             _isGenerating.value = true
             try {
-                when (pending.kind) {
-                    AgentMutationKind.TRASH_NOTE -> {
-                        store.moveNoteToTrash(pending.note.id).getOrThrow()
-                        store.recordAgentAudit(
-                            "move_note_to_trash",
-                            pending.note.id,
-                            "Moved '${agentNoteTitle(pending.note)}' to Trash"
-                        )
-                        appendToolMessage("move_note_to_trash", "Moved “${agentNoteTitle(pending.note)}” to Trash. You can restore it from Notes → Trash.")
-                    }
-
-                    AgentMutationKind.RENAME_NOTE -> {
-                        pipeline.update(pending.note, pending.newTitle, pending.note.content).getOrThrow()
-                        enqueueJob(pending.note.id, ProcessingJobType.ORGANIZE)
-                        store.recordAgentAudit(
-                            "update_note",
-                            pending.note.id,
-                            "Renamed note to '${pending.newTitle}'"
-                        )
-                        appendToolMessage("update_note", "Renamed the note to “${pending.newTitle}”.")
-                    }
-
-                    AgentMutationKind.REPLACE_NOTE -> {
-                        pipeline.update(pending.note, pending.note.title, pending.newContent).getOrThrow()
-                        enqueueJob(pending.note.id, ProcessingJobType.ORGANIZE)
-                        store.recordAgentAudit(
-                            "update_note",
-                            pending.note.id,
-                            "Replaced the content of '${agentNoteTitle(pending.note)}'"
-                        )
-                        appendToolMessage("update_note", "Updated “${agentNoteTitle(pending.note)}”. The knowledge graph will be rebuilt from the new content.")
-                    }
-
-                    AgentMutationKind.APPEND_NOTE -> {
-                        val combinedContent = listOf(pending.note.content.trimEnd(), pending.newContent.trim())
-                            .filter(String::isNotBlank)
-                            .joinToString("\n\n")
-                        pipeline.update(pending.note, pending.note.title, combinedContent).getOrThrow()
-                        enqueueJob(pending.note.id, ProcessingJobType.ORGANIZE)
-                        store.recordAgentAudit(
-                            "append_note",
-                            pending.note.id,
-                            "Appended content to '${agentNoteTitle(pending.note)}'"
-                        )
-                        appendToolMessage("append_note", "Added the new text to “${agentNoteTitle(pending.note)}” and queued graph organization.")
-                    }
-                }
-                _pendingAgentMutation.value = null
-                loadData()
+                _pendingAgentPlan.value = null
+                executeAgentPlan(pending)
             } catch (error: Exception) {
                 appendToolMessage(
                     "tool_error",
@@ -917,126 +917,229 @@ class BrainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun cancelAgentMutation() {
-        if (_pendingAgentMutation.value == null) return
-        _pendingAgentMutation.value = null
-        appendToolMessage("cancelled", "Cancelled. Nothing was changed.")
+    fun cancelAgentPlan() {
+        if (_pendingAgentPlan.value == null) return
+        _pendingAgentPlan.value = null
+        appendToolMessage("cancelled", "Cancelled the plan. Nothing was changed.")
     }
 
-    private suspend fun handleAgentCommand(command: AgentCommand) {
-        when (command) {
-            is AgentCommand.CreateNote -> {
-                val note = pipeline.capture(command.title, command.content).getOrThrow()
-                enqueueJob(note.id, ProcessingJobType.ORGANIZE)
-                store.recordAgentAudit("create_note", note.id, "Created '${agentNoteTitle(note)}'")
-                loadData()
-                appendToolMessage("create_note", "Created “${agentNoteTitle(note)}” and queued private organization.")
-            }
-
-            is AgentCommand.TrashNote -> {
-                val note = resolveSingleNote(command.query, _notes.value, command.noteId) ?: return
-                _pendingAgentMutation.value = PendingAgentMutation(
-                    kind = AgentMutationKind.TRASH_NOTE,
-                    note = note,
-                    prompt = "Move “${agentNoteTitle(note)}” to Trash? Its actions and graph facts will disappear until restored."
-                )
-                appendToolMessage("move_note_to_trash", "I found “${agentNoteTitle(note)}”. Confirm below before I move it to Trash.")
-            }
-
-            is AgentCommand.RestoreNote -> {
-                val note = resolveSingleNote(
-                    command.query,
-                    _trashedNotes.value.map(TrashedNote::note),
-                    command.noteId
-                ) ?: return
-                store.restoreNote(note.id).getOrThrow()
-                enqueueJob(note.id, ProcessingJobType.ORGANIZE)
-                store.recordAgentAudit("restore_note", note.id, "Restored '${agentNoteTitle(note)}'")
-                loadData()
-                appendToolMessage("restore_note", "Restored “${agentNoteTitle(note)}” and queued graph organization.")
-            }
-
-            is AgentCommand.RenameNote -> {
-                val note = resolveSingleNote(command.query, _notes.value, command.noteId) ?: return
-                _pendingAgentMutation.value = PendingAgentMutation(
-                    kind = AgentMutationKind.RENAME_NOTE,
-                    note = note,
-                    newTitle = command.newTitle,
-                    prompt = "Rename “${agentNoteTitle(note)}” to “${command.newTitle}”?"
-                )
-                appendToolMessage("update_note", "I prepared the rename. Confirm below before I change the note.")
-            }
-
-            is AgentCommand.ReplaceNote -> {
-                val note = resolveSingleNote(command.query, _notes.value, command.noteId) ?: return
-                _pendingAgentMutation.value = PendingAgentMutation(
-                    kind = AgentMutationKind.REPLACE_NOTE,
-                    note = note,
-                    newContent = command.newContent,
-                    prompt = "Replace the content of “${agentNoteTitle(note)}”? This will rebuild its actions and graph facts."
-                )
-                appendToolMessage("update_note", "I prepared the content replacement. Confirm below before I overwrite the current text.")
-            }
-
-            is AgentCommand.AppendNote -> {
-                val note = resolveSingleNote(command.query, _notes.value, command.noteId) ?: return
-                _pendingAgentMutation.value = PendingAgentMutation(
-                    kind = AgentMutationKind.APPEND_NOTE,
-                    note = note,
-                    newContent = command.addition,
-                    prompt = "Add this text to “${agentNoteTitle(note)}”? The existing content will be kept."
-                )
-                appendToolMessage("append_note", "I prepared text to append to “${agentNoteTitle(note)}”. Confirm below before I change the note.")
-            }
-
-            AgentCommand.ListNotes -> {
-                val visible = _notes.value.take(12)
-                appendToolMessage(
-                    "list_notes",
-                    if (visible.isEmpty()) "You have no active notes."
-                    else visible.joinToString(prefix = "Your recent notes:\n", separator = "\n") { "• ${agentNoteTitle(it)}" }
-                )
-            }
-
-            AgentCommand.ListTrash -> {
-                val trashed = _trashedNotes.value.take(12)
-                appendToolMessage(
-                    "list_trash",
-                    if (trashed.isEmpty()) "Trash is empty."
-                    else trashed.joinToString(prefix = "Notes in Trash:\n", separator = "\n") { "• ${agentNoteTitle(it.note)}" }
-                )
-            }
-
-            is AgentCommand.CreateAction -> {
-                val dueTimestamp = command.dueDate
-                    ?.atStartOfDay(ZoneId.systemDefault())
-                    ?.toEpochSecond()
-                    ?.toDouble()
-                val action = store.saveAction(ActionItem.manual(command.text, dueTimestamp)).getOrThrow()
-                store.recordAgentAudit("create_action", action.id, "Created action '${action.text}'")
-                loadData()
-                appendToolMessage(
-                    "create_action",
-                    "Created action “${action.text}”${command.dueDate?.let { " for $it" }.orEmpty()}."
-                )
-            }
-
-            is AgentCommand.CompleteAction -> {
-                val matches = matchActions(command.query, command.actionId)
-                if (matches.size != 1) {
-                    appendToolMessage(
-                        "complete_action",
-                        if (matches.isEmpty()) "I could not find an open action matching “${command.query}”."
-                        else "I found multiple matching actions: ${matches.take(5).joinToString { "“${it.text}”" }}. Use more of the action text."
-                    )
-                    return
+    fun undoLastAgentPlan() {
+        val undoable = undoableAgentPlan ?: return
+        if (_isGenerating.value || _pendingAgentPlan.value != null) return
+        viewModelScope.launch {
+            _isGenerating.value = true
+            try {
+                val failures = undoable.operations.asReversed().mapNotNull { operation ->
+                    runCatching { undoAgentOperation(operation) }.exceptionOrNull()
                 }
-                val action = matches.single()
-                store.updateActionStatus(action.id, ActionStatus.COMPLETED).getOrThrow()
-                store.recordAgentAudit("complete_action", action.id, "Completed action '${action.text}'")
                 loadData()
-                appendToolMessage("complete_action", "Completed “${action.text}”.")
+                _agentExecutions.value = _agentExecutions.value.map {
+                    if (it.id != undoable.executionId) it else if (failures.isEmpty()) {
+                        it.copy(status = AgentExecutionStatus.UNDONE, message = "Undone")
+                    } else {
+                        it.copy(status = AgentExecutionStatus.FAILED, message = "Undo incomplete")
+                    }
+                }
+                undoableAgentPlan = null
+                _canUndoAgentPlan.value = false
+                if (failures.isEmpty()) {
+                    store.recordAgentAudit("undo_plan", undoable.executionId, "Undid agent plan")
+                    appendToolMessage("undo_plan", "Undid the last agent plan. Previous content and action states were restored; newly created notes were moved to Trash.")
+                } else {
+                    store.recordAgentAudit("undo_plan", undoable.executionId, "Undo incomplete", "FAILED")
+                    appendToolMessage("undo_error", "Undo finished with ${failures.size} failed ${if (failures.size == 1) "step" else "steps"}. Review your notes and actions before making another change.")
+                }
+            } catch (error: Exception) {
+                appendToolMessage("undo_error", "I could not fully undo that plan: ${error.message ?: "unknown error"}")
+            } finally {
+                _isGenerating.value = false
             }
+        }
+    }
+
+    private suspend fun stageAgentPlan(commands: List<AgentCommand>, source: AgentRoute.Source) {
+        val steps = commands.map { prepareAgentStep(it) ?: return }
+        val plan = PendingAgentPlan(steps = steps, source = source)
+        if (steps.none(AgentPlanStep::changesData)) {
+            executeAgentPlan(plan)
+        } else {
+            _pendingAgentPlan.value = plan
+            appendToolMessage(
+                "plan_ready",
+                "I prepared ${steps.size} ${if (steps.size == 1) "step" else "steps"}. Review the plan below before anything changes."
+            )
+        }
+    }
+
+    private fun prepareAgentStep(command: AgentCommand): AgentPlanStep? = when (command) {
+        is AgentCommand.CreateNote -> AgentPlanStep(
+            command,
+            "Create note",
+            command.title.ifBlank { command.content.take(72) },
+            true
+        )
+        is AgentCommand.TrashNote -> resolveSingleNote(command.query, _notes.value, command.noteId)?.let { note ->
+            AgentPlanStep(command.copy(query = agentNoteTitle(note), noteId = note.id), "Move note to Trash", agentNoteTitle(note), true)
+        }
+        is AgentCommand.RestoreNote -> resolveSingleNote(
+            command.query,
+            _trashedNotes.value.map(TrashedNote::note),
+            command.noteId
+        )?.let { note ->
+            AgentPlanStep(command.copy(query = agentNoteTitle(note), noteId = note.id), "Restore note", agentNoteTitle(note), true)
+        }
+        is AgentCommand.RenameNote -> resolveSingleNote(command.query, _notes.value, command.noteId)?.let { note ->
+            AgentPlanStep(command.copy(query = agentNoteTitle(note), noteId = note.id), "Rename note", "${agentNoteTitle(note)} → ${command.newTitle}", true)
+        }
+        is AgentCommand.ReplaceNote -> resolveSingleNote(command.query, _notes.value, command.noteId)?.let { note ->
+            AgentPlanStep(command.copy(query = agentNoteTitle(note), noteId = note.id), "Replace note content", agentNoteTitle(note), true)
+        }
+        is AgentCommand.AppendNote -> resolveSingleNote(command.query, _notes.value, command.noteId)?.let { note ->
+            AgentPlanStep(command.copy(query = agentNoteTitle(note), noteId = note.id), "Append to note", agentNoteTitle(note), true)
+        }
+        AgentCommand.ListNotes -> AgentPlanStep(command, "List notes", "Show recent active notes", false)
+        AgentCommand.ListTrash -> AgentPlanStep(command, "List Trash", "Show recoverable deleted notes", false)
+        is AgentCommand.CreateAction -> AgentPlanStep(
+            command,
+            "Create action",
+            command.text + command.dueDate?.let { " · due $it" }.orEmpty(),
+            true
+        )
+        is AgentCommand.CompleteAction -> {
+            val matches = matchActions(command.query, command.actionId)
+            when {
+                matches.size == 1 -> matches.single().let { action ->
+                    AgentPlanStep(command.copy(query = action.text, actionId = action.id), "Complete action", action.text, true)
+                }
+                matches.isEmpty() -> {
+                    appendToolMessage("complete_action", "I could not find an open action matching “${command.query}”.")
+                    null
+                }
+                else -> {
+                    appendToolMessage("complete_action", "I found multiple matching actions: ${matches.take(5).joinToString { "“${it.text}”" }}. Use more of the action text.")
+                    null
+                }
+            }
+        }
+    }
+
+    private suspend fun executeAgentPlan(plan: PendingAgentPlan) {
+        val execution = AgentExecutionUi(
+            id = plan.id,
+            stepSummaries = plan.steps.map { "${it.title}: ${it.detail}" },
+            status = AgentExecutionStatus.RUNNING,
+            message = "Running ${plan.steps.size} ${if (plan.steps.size == 1) "step" else "steps"}…"
+        )
+        _agentExecutions.value = listOf(execution) + _agentExecutions.value.take(9)
+        val applied = mutableListOf<AppliedAgentStep>()
+        try {
+            plan.steps.forEach { step ->
+                val result = applyAgentCommand(step.command)
+                applied += result
+                store.recordAgentAudit(result.tool, result.targetId, result.summary).getOrThrow()
+            }
+            loadData()
+            val undoOperations = applied.mapNotNull(AppliedAgentStep::undo)
+            undoableAgentPlan = undoOperations.takeIf(List<*>::isNotEmpty)?.let { UndoableAgentPlan(plan.id, it) }
+            _canUndoAgentPlan.value = undoableAgentPlan != null
+            _agentExecutions.value = _agentExecutions.value.map {
+                if (it.id == plan.id) it.copy(status = AgentExecutionStatus.SUCCEEDED, message = "Completed ${applied.size} ${if (applied.size == 1) "step" else "steps"}") else it
+            }
+            store.recordAgentAudit("agent_plan", plan.id, "Completed ${applied.size} steps")
+            appendToolMessage(
+                "agent_plan",
+                applied.joinToString(prefix = "Done:\n", separator = "\n") { "• ${it.summary}" } +
+                    if (undoOperations.isNotEmpty()) "\n\nYou can undo this plan below." else ""
+            )
+        } catch (error: Exception) {
+            val rollbackErrors = applied.asReversed().mapNotNull { result ->
+                result.undo?.let { undo -> runCatching { undoAgentOperation(undo) }.exceptionOrNull() }
+            }
+            loadData()
+            undoableAgentPlan = null
+            _canUndoAgentPlan.value = false
+            val rollbackMessage = if (rollbackErrors.isEmpty()) "Completed steps were rolled back." else "Some rollback steps failed; review your notes and actions."
+            _agentExecutions.value = _agentExecutions.value.map {
+                if (it.id == plan.id) it.copy(status = AgentExecutionStatus.FAILED, message = rollbackMessage) else it
+            }
+            store.recordAgentAudit("agent_plan", plan.id, error.message ?: "Plan failed", "FAILED")
+            appendToolMessage("plan_failed", "The plan stopped: ${error.message ?: "unknown error"}. $rollbackMessage")
+        }
+    }
+
+    private suspend fun applyAgentCommand(command: AgentCommand): AppliedAgentStep = when (command) {
+        is AgentCommand.CreateNote -> {
+            val note = pipeline.capture(command.title, command.content).getOrThrow()
+            enqueueJob(note.id, ProcessingJobType.ORGANIZE)
+            AppliedAgentStep("create_note", note.id, "Created “${agentNoteTitle(note)}”", AgentUndoOperation.TrashCreatedNote(note.id))
+        }
+        is AgentCommand.TrashNote -> {
+            val note = store.getNote(requireNotNull(command.noteId)).getOrThrow() ?: error("Note is no longer active")
+            store.moveNoteToTrash(note.id).getOrThrow()
+            AppliedAgentStep("move_note_to_trash", note.id, "Moved “${agentNoteTitle(note)}” to Trash", AgentUndoOperation.RestoreTrashedNote(note.id))
+        }
+        is AgentCommand.RestoreNote -> {
+            val note = store.getNote(requireNotNull(command.noteId), includeTrashed = true).getOrThrow() ?: error("Trashed note no longer exists")
+            store.restoreNote(note.id).getOrThrow()
+            enqueueJob(note.id, ProcessingJobType.ORGANIZE)
+            AppliedAgentStep("restore_note", note.id, "Restored “${agentNoteTitle(note)}”", AgentUndoOperation.TrashRestoredNote(note.id))
+        }
+        is AgentCommand.RenameNote -> {
+            val before = store.getNote(requireNotNull(command.noteId)).getOrThrow() ?: error("Note is no longer active")
+            pipeline.update(before, command.newTitle, before.content).getOrThrow()
+            enqueueJob(before.id, ProcessingJobType.ORGANIZE)
+            AppliedAgentStep("rename_note", before.id, "Renamed “${agentNoteTitle(before)}” to “${command.newTitle}”", AgentUndoOperation.RestoreNoteSnapshot(before))
+        }
+        is AgentCommand.ReplaceNote -> {
+            val before = store.getNote(requireNotNull(command.noteId)).getOrThrow() ?: error("Note is no longer active")
+            pipeline.update(before, before.title, command.newContent).getOrThrow()
+            enqueueJob(before.id, ProcessingJobType.ORGANIZE)
+            AppliedAgentStep("replace_note", before.id, "Replaced content in “${agentNoteTitle(before)}”", AgentUndoOperation.RestoreNoteSnapshot(before))
+        }
+        is AgentCommand.AppendNote -> {
+            val before = store.getNote(requireNotNull(command.noteId)).getOrThrow() ?: error("Note is no longer active")
+            val content = listOf(before.content.trimEnd(), command.addition.trim()).filter(String::isNotBlank).joinToString("\n\n")
+            pipeline.update(before, before.title, content).getOrThrow()
+            enqueueJob(before.id, ProcessingJobType.ORGANIZE)
+            AppliedAgentStep("append_note", before.id, "Added text to “${agentNoteTitle(before)}”", AgentUndoOperation.RestoreNoteSnapshot(before))
+        }
+        AgentCommand.ListNotes -> {
+            val visible = _notes.value.take(12)
+            val summary = if (visible.isEmpty()) "You have no active notes." else visible.joinToString(prefix = "Recent notes:\n", separator = "\n") { "• ${agentNoteTitle(it)}" }
+            AppliedAgentStep("list_notes", "notes", summary, null)
+        }
+        AgentCommand.ListTrash -> {
+            val trashed = _trashedNotes.value.take(12)
+            val summary = if (trashed.isEmpty()) "Trash is empty." else trashed.joinToString(prefix = "Trash:\n", separator = "\n") { "• ${agentNoteTitle(it.note)}" }
+            AppliedAgentStep("list_trash", "trash", summary, null)
+        }
+        is AgentCommand.CreateAction -> {
+            val dueTimestamp = command.dueDate?.atStartOfDay(ZoneId.systemDefault())?.toEpochSecond()?.toDouble()
+            val action = store.saveAction(ActionItem.manual(command.text, dueTimestamp)).getOrThrow()
+            AppliedAgentStep("create_action", action.id, "Created action “${action.text}”", AgentUndoOperation.DeleteCreatedAction(action.id))
+        }
+        is AgentCommand.CompleteAction -> {
+            val action = store.getActionItem(requireNotNull(command.actionId)).getOrThrow() ?: error("Action is no longer open")
+            store.updateActionStatus(action.id, ActionStatus.COMPLETED).getOrThrow()
+            AppliedAgentStep("complete_action", action.id, "Completed “${action.text}”", AgentUndoOperation.RestoreActionStatus(action.id, action.status))
+        }
+    }
+
+    private suspend fun undoAgentOperation(operation: AgentUndoOperation) {
+        when (operation) {
+            is AgentUndoOperation.TrashCreatedNote -> store.moveNoteToTrash(operation.noteId).getOrThrow()
+            is AgentUndoOperation.RestoreTrashedNote -> {
+                store.restoreNote(operation.noteId).getOrThrow()
+                enqueueJob(operation.noteId, ProcessingJobType.ORGANIZE)
+            }
+            is AgentUndoOperation.TrashRestoredNote -> store.moveNoteToTrash(operation.noteId).getOrThrow()
+            is AgentUndoOperation.RestoreNoteSnapshot -> {
+                val current = store.getNote(operation.note.id).getOrThrow() ?: error("Note is no longer active")
+                pipeline.update(current, operation.note.title, operation.note.content).getOrThrow()
+                enqueueJob(operation.note.id, ProcessingJobType.ORGANIZE)
+            }
+            is AgentUndoOperation.DeleteCreatedAction -> store.deleteAction(operation.actionId).getOrThrow()
+            is AgentUndoOperation.RestoreActionStatus -> store.updateActionStatus(operation.actionId, operation.status).getOrThrow()
         }
     }
 

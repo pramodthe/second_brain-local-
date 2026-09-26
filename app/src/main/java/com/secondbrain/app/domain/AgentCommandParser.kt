@@ -17,6 +17,21 @@ sealed interface AgentCommand {
 
 /** Strict local parser for mutating chat commands. Unknown text remains a normal RAG question. */
 object AgentCommandParser {
+    /**
+     * Parses an explicit sequence without guessing where free-form note content ends. Splitting is
+     * attempted only when the complete input is not already one valid command, and every segment
+     * must independently match the strict command grammar.
+     */
+    fun parsePlan(input: String, today: LocalDate = LocalDate.now()): List<AgentCommand>? {
+        val parts = input.trim().split(PLAN_SEPARATOR).map(String::trim).filter(String::isNotBlank)
+        if (parts.size in 2..MAX_PLAN_STEPS) {
+            parts.map { parse(it, today) ?: return@map null }
+                .takeIf { commands -> commands.none { it == null } }
+                ?.let { commands -> return commands.filterNotNull() }
+        }
+        return parse(input, today)?.let(::listOf)
+    }
+
     fun parse(input: String, today: LocalDate = LocalDate.now()): AgentCommand? {
         val text = input.trim()
         if (text.isBlank()) return null
@@ -114,4 +129,9 @@ object AgentCommandParser {
         "(?:complete|finish|mark done)(?: the)? (?:action|task|todo)(?: named| called)?[ :]+(.+?)(?: please)?[.!]?",
         RegexOption.IGNORE_CASE
     )
+    private val PLAN_SEPARATOR = Regex(
+        """(?:[.;]\s*|\s+(?:and then|then|and)\s+)(?=(?:create|add|save|make|remember|delete|trash|move|restore|rename|replace|update|append|complete|finish|mark|show|list)\b)""",
+        RegexOption.IGNORE_CASE
+    )
+    private const val MAX_PLAN_STEPS = 6
 }

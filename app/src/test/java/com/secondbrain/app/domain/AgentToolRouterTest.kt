@@ -43,6 +43,17 @@ class AgentToolRouterTest {
     }
 
     @Test
+    fun `accepts compact on-device wire format`() {
+        assertEquals(
+            AgentRoute.Tool(AgentCommand.TrashNote("Team meeting", "note-1"), AgentRoute.Source.QWEN),
+            router.parseModelResponse(
+                """{"d":"t","t":"trash_note","a":{"note_id":"note-1"}}""",
+                inventory
+            )
+        )
+    }
+
+    @Test
     fun `rejects an id that was not in the supplied inventory`() {
         val route = router.parseModelResponse(
             """{"decision":"tool","tool":"trash_note","arguments":{"note_id":"invented"}}""",
@@ -107,5 +118,34 @@ class AgentToolRouterTest {
             AgentRoute.Question,
             router.parseModelResponse("preamble {\"decision\":\"question\"}", inventory)
         )
+    }
+
+    @Test
+    fun `parses and validates an ordered multi-step plan`() {
+        val route = router.parseModelResponse(
+            """{"decision":"plan","steps":[{"tool":"append_note","arguments":{"note_id":"note-1","addition":"Sam owns the prototype"}},{"tool":"create_action","arguments":{"text":"Call Sam","due_date":"2026-09-26"}}]}""",
+            inventory
+        )
+
+        assertEquals(
+            AgentRoute.Plan(
+                listOf(
+                    AgentCommand.AppendNote("Team meeting", "Sam owns the prototype", "note-1"),
+                    AgentCommand.CreateAction("Call Sam", LocalDate.of(2026, 9, 26))
+                ),
+                AgentRoute.Source.QWEN
+            ),
+            route
+        )
+    }
+
+    @Test
+    fun `rejects an unsafe id anywhere in a plan`() {
+        val route = router.parseModelResponse(
+            """{"decision":"plan","steps":[{"tool":"list_notes","arguments":{}},{"tool":"trash_note","arguments":{"note_id":"invented"}}]}""",
+            inventory
+        )
+
+        assertTrue(route is AgentRoute.Clarify)
     }
 }
